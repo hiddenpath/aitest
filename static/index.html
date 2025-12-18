@@ -1,0 +1,782 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Round-robin AI Chat (3 Providers)</title>
+<style>
+@font-face {
+    font-family: 'Intel One Mono';
+    src: url('/fonts/IntelOneMono-Regular.woff2') format('woff2'),
+         url('/fonts/IntelOneMono-Regular.woff') format('woff');
+    font-style: normal;
+    font-weight: 400;
+    font-display: swap;
+}
+* { box-sizing: border-box; }
+
+body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Helvetica Neue', Arial, sans-serif;
+    margin: 0;
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    color: #333;
+}
+
+#header {
+    background: rgba(255, 255, 255, 0.95);
+    backdrop-filter: blur(10px);
+    padding: 15px 20px;
+    box-shadow: 0 2px 20px rgba(0, 0, 0, 0.1);
+    border-bottom: 1px solid rgba(255, 255, 255, 0.2);
+}
+
+#header h1 {
+    margin: 0;
+    font-size: 24px;
+    font-weight: 600;
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+}
+
+#chat-container {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    padding: 20px;
+    overflow-y: auto;
+    gap: 16px;
+}
+
+.message {
+    margin: 0;
+    padding: 16px 20px;
+    border-radius: 18px;
+    max-width: 75%;
+    word-wrap: break-word;
+    box-shadow: 0 2px 12px rgba(0, 0, 0, 0.15);
+    position: relative;
+    animation: messageSlide 0.3s ease-out;
+}
+
+.speaker-info {
+    font-size: 12px;
+    font-weight: 600;
+    margin-bottom: 8px;
+    opacity: 0.8;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+
+.message-content {
+    margin-top: 4px;
+}
+
+@keyframes messageSlide {
+    from { opacity: 0; transform: translateY(10px); }
+    to { opacity: 1; transform: translateY(0); }
+}
+
+.user {
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    color: white;
+    align-self: flex-end;
+    border-bottom-right-radius: 6px;
+}
+
+.assistant {
+    background: rgba(255, 255, 255, 0.95);
+    color: #333;
+    align-self: flex-start;
+    border-bottom-left-radius: 6px;
+    backdrop-filter: blur(10px);
+}
+
+.system-info {
+    background: rgba(255, 255, 255, 0.9);
+    border: 2px solid #667eea;
+    border-radius: 12px;
+    padding: 12px 16px;
+    margin: 8px 0;
+    font-size: 14px;
+    color: #555;
+    align-self: center;
+    max-width: 90%;
+    text-align: center;
+}
+
+#input-area {
+    display: flex;
+    padding: 20px;
+    background: rgba(255, 255, 255, 0.95);
+    backdrop-filter: blur(10px);
+    border-top: 1px solid rgba(255, 255, 255, 0.2);
+    gap: 12px;
+    align-items: flex-end;
+    flex-wrap: wrap;
+}
+
+#message-input {
+    flex: 1;
+    padding: 12px 16px;
+    border: 2px solid rgba(102, 126, 234, 0.2);
+    border-radius: 12px;
+    font-size: 16px;
+    resize: none;
+    min-height: 48px;
+    max-height: 120px;
+    font-family: inherit;
+    background: white;
+    transition: all 0.2s ease;
+    line-height: 1.4;
+}
+
+.btn {
+    padding: 12px 20px;
+    border: none;
+    border-radius: 12px;
+    cursor: pointer;
+    font-size: 14px;
+    font-weight: 600;
+    transition: all 0.2s ease;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-height: 48px;
+}
+.btn-outline { background: #fff; border: 1px solid #d1d9e0; color: #4a5568; }
+
+#send-btn {
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    color: white;
+}
+
+#new-chat-btn {
+    background: linear-gradient(135deg, #11998e 0%, #38ef7d 100%);
+    color: white;
+}
+
+
+
+.assistant pre {
+    background: #f6f8fa;
+    padding: 16px;
+    border-radius: 8px;
+    overflow-x: auto;
+    margin: 12px 0;
+    border: 1px solid #d1d9e0;
+    font-size: 14px;
+    line-height: 1.45;
+    font-family: 'Intel One Mono', 'SF Mono', 'Monaco', 'Inconsolata', 'Roboto Mono', 'Consolas', monospace;
+    position: relative;
+}
+
+.assistant code {
+    background: #f1f3f4;
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-family: 'Intel One Mono', 'SF Mono', 'Monaco', 'Inconsolata', 'Roboto Mono', 'Consolas', monospace;
+    font-size: 0.9em;
+    color: #d73a49;
+}
+
+/* Block code should use a neutral base color; inline code stays red above */
+.assistant pre code { color: #24292e !important; }
+
+/* GitHub Light-like theme (works for both fallback and Prism tokens) */
+.assistant pre { background: #f6f8fa; }
+.assistant pre code .token-comment, .assistant pre code .token-cmt { color: #6a737d; font-style: italic; }
+.assistant pre code .token-string, .assistant pre code .token-str { color: #032f62; }
+.assistant pre code .token-number, .assistant pre code .token-num { color: #005cc5; }
+.assistant pre code .token-keyword, .assistant pre code .token-kw { color: #d73a49; font-weight: 600; }
+.assistant pre code .token-function, .assistant pre code .token-fn { color: #6f42c1; }
+.assistant pre code .token-boolean { color: #005cc5; }
+.assistant pre code .token-operator { color: #d73a49; }
+.assistant pre code .token-attr-name { color: #6f42c1; }
+.assistant pre code .token-constant { color: #005cc5; }
+.assistant pre code .token-class-name { color: #6f42c1; }
+.assistant pre code .token-punctuation { color: #24292e; }
+
+/* Copy button */
+.copy-btn {
+    position: absolute;
+    top: 8px;
+    right: 8px;
+    background: transparent; /* transparent base */
+    border: none;
+    border-radius: 6px;
+    padding: 6px 10px;
+    font-size: 12px;
+    color: #4a5568; /* default for light bubbles */
+    cursor: pointer;
+    z-index: 2;
+    box-shadow: none;
+    pointer-events: auto;
+}
+.assistant .copy-btn { color: #4a5568; }
+.assistant .copy-btn:hover { background: rgba(0,0,0,0.06); }
+.copy-btn { opacity: 1; transition: background .15s ease, opacity .15s ease; }
+
+/* Message-level copy button */
+.msg-copy-btn {
+    position: absolute;
+    top: 8px;
+    right: 8px;
+    background: transparent; /* transparent base */
+    border: none;
+    border-radius: 6px;
+    padding: 6px 10px;
+    font-size: 12px;
+    color: #4a5568; /* default; overridden per role */
+    cursor: pointer;
+    z-index: 12; /* ensure above content */
+    box-shadow: none;
+}
+.assistant .msg-copy-btn { color: #4a5568; }
+.assistant .msg-copy-btn:hover { background: rgba(0,0,0,0.06); }
+.user .msg-copy-btn { color: rgba(255,255,255,0.92); }
+.user .msg-copy-btn:hover { background: rgba(255,255,255,0.16); }
+
+/* Markdown 内容样式 */
+.markdown-content {
+    line-height: 1.6;
+}
+
+.markdown-content p {
+    margin: 0.8em 0;
+}
+
+.markdown-content h1, .markdown-content h2, .markdown-content h3 {
+    margin: 1.2em 0 0.6em 0;
+    font-weight: 600;
+    color: #2c3e50;
+}
+
+.markdown-content h1 { font-size: 1.4em; }
+.markdown-content h2 { font-size: 1.3em; }
+.markdown-content h3 { font-size: 1.2em; }
+
+.markdown-content ul, .markdown-content ol {
+    margin: 0.8em 0;
+    padding-left: 1.5em;
+}
+
+.markdown-content li {
+    margin: 0.3em 0;
+    line-height: 1.5;
+}
+
+.markdown-content strong {
+    font-weight: 600;
+    color: #2c3e50;
+}
+
+.markdown-content em {
+    font-style: italic;
+    color: #34495e;
+}
+
+.markdown-content a {
+    color: #3498db;
+    text-decoration: none;
+}
+
+.markdown-content a:hover {
+    text-decoration: underline;
+}
+
+/* Markdown tables: light gray borders and compact layout */
+.markdown-content table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 0.8em 0;
+}
+.markdown-content th, .markdown-content td {
+    border: 1px solid #e5e7eb; /* light gray */
+    padding: 8px 10px;
+    text-align: left;
+    vertical-align: top;
+}
+.markdown-content thead th {
+    background: #f9fafb;
+    font-weight: 600;
+}
+
+@media (max-width: 768px) {
+    #input-area { padding: 16px; }
+}
+</style>
+</head>
+<body>
+<div id="header">
+    <h1>🚀 Round-robin AI Chat</h1>
+</div>
+
+<div id="chat-container"></div>
+
+<div id="input-area">
+    <button id="new-chat-btn" class="btn">✨ New Chat</button>
+    
+    <!-- 简化：不再展示智能调度/模型选择/成本设置 -->
+    
+    <textarea id="message-input" placeholder="Type a message... Shift+Enter for newline, Enter to send" rows="1"></textarea>
+    <button id="send-btn" class="btn">📤 Send</button>
+    <button id="copy-last-user-btn" class="btn btn-outline" title="Copy last user message">👤 Copy User</button>
+    <button id="copy-last-assistant-btn" class="btn btn-outline" title="Copy last assistant reply">🤖 Copy Reply</button>
+</div>
+
+<!-- 使用本地marked.js轻量级Markdown解析器 -->
+<script src="/js/marked.min.js"></script>
+<script>
+// Very small sanitizer to remove script tags and on* attributes
+function sanitize(html){
+    const template = document.createElement('template');
+    template.innerHTML = html; // not added to DOM yet
+    const disallow = ['script', 'iframe', 'object', 'embed', 'link', 'style'];
+    const walker = document.createTreeWalker(template.content, NodeFilter.SHOW_ELEMENT, null);
+    const toRemove = [];
+    while (walker.nextNode()){
+        const el = walker.currentNode;
+        if (disallow.includes(el.tagName?.toLowerCase?.())) { toRemove.push(el); continue; }
+        // Remove on* handlers and javascript: URLs
+        [...el.attributes].forEach(attr => {
+            if (/^on/i.test(attr.name)) el.removeAttribute(attr.name);
+            if ((attr.name === 'href' || attr.name === 'src') && /^\s*javascript:/i.test(attr.value)) el.removeAttribute(attr.name);
+        });
+    }
+    toRemove.forEach(n => n.remove());
+    return template.innerHTML;
+}
+</script>
+<script>
+// Configure marked locally (no network)
+try {
+    marked.setOptions({
+        gfm: true,
+        breaks: true,      // single newlines -> <br>
+        smartLists: true,  // better list parsing
+        headerIds: false,
+        mangle: false
+    });
+} catch {}
+
+function renderMarkdown(src) {
+    // Normalize CRLF to LF to avoid list/paragraph issues caused by \r
+    const s = (src || '').replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+    try { return sanitize(marked.parse(s)); } catch { return sanitize(s.replace(/\n/g, '<br>')); }
+}
+const chatContainer = document.getElementById('chat-container');
+const input = document.getElementById('message-input');
+const sendBtn = document.getElementById('send-btn');
+const newChatBtn = document.getElementById('new-chat-btn');
+const copyLastUserBtn = document.getElementById('copy-last-user-btn');
+const copyLastAssistantBtn = document.getElementById('copy-last-assistant-btn');
+// 简化：不再需要模型选择和智能模式控件
+
+// User ID and session management
+let userId = localStorage.getItem('groqchat_user_id');
+if (!userId) {
+    userId = 'user-' + Math.random().toString(36).substring(2, 10);
+    localStorage.setItem('groqchat_user_id', userId);
+}
+
+let sessionId = localStorage.getItem('groqchat_session_id');
+if (!sessionId) {
+    sessionId = 'session-' + Date.now() + '-' + Math.random().toString(36).substring(2, 8);
+    localStorage.setItem('groqchat_session_id', sessionId);
+}
+
+let history = [];
+// 简化：固定后端轮询，无需智能模式
+
+// Render chat messages
+function renderMessages() {
+    chatContainer.innerHTML = '';
+    history.forEach(msg => {
+        const div = document.createElement('div');
+        div.className = `message ${msg.role}`;
+        
+        // Speaker info
+        let speakerInfo = '';
+        if (msg.role === 'assistant' && msg.provider) {
+            speakerInfo = `<div class="speaker-info">🤖 ${msg.provider}</div>`;
+        } else if (msg.role === 'user') {
+            speakerInfo = `<div class="speaker-info">👤 User</div>`;
+        }
+        
+        if (msg.role === 'assistant') {
+            // 使用marked.js解析Markdown
+            const contentHtml = msg.content ? renderMarkdown(msg.content) : '';
+            div.innerHTML = speakerInfo + `<div class="message-content markdown-content">${contentHtml}</div>`;
+            queueMicrotask(() => { try { enhanceCodeBlocks(div); } catch(e) { console.warn('enhanceCodeBlocks failed', e); } });
+        } else {
+            const userContent = msg.content.replace(/\n/g, '<br>');
+            div.innerHTML = speakerInfo + `<div class="message-content">${userContent}</div>`;
+        }
+
+        // Message-level copy button (copies the whole visible message content)
+        try {
+            const btn = document.createElement('button');
+            btn.className = 'msg-copy-btn';
+            btn.setAttribute('aria-label','Copy message');
+            btn.setAttribute('title','Copy message');
+            const icon = '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/><path d="M9 5h4"/></svg>';
+            const check = '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg>';
+            btn.innerHTML = icon;
+            btn.addEventListener('click', async () => {
+                const contentEl = div.querySelector('.message-content');
+                const text = contentEl ? contentEl.innerText : '';
+                try {
+                    await navigator.clipboard.writeText(text);
+                    const old = btn.innerHTML; btn.innerHTML = check; btn.setAttribute('aria-label','Copied');
+                    setTimeout(()=>{ btn.innerHTML = icon; btn.setAttribute('aria-label','Copy message'); }, 1200);
+                } catch {
+                    // Fallback: textarea hack
+                    const ta = document.createElement('textarea');
+                    ta.value = text; document.body.appendChild(ta); ta.select();
+                    try { document.execCommand('copy'); } finally { document.body.removeChild(ta); }
+                    const old = btn.innerHTML; btn.innerHTML = check; btn.setAttribute('aria-label','Copied');
+                    setTimeout(()=>{ btn.innerHTML = icon; btn.setAttribute('aria-label','Copy message'); }, 1200);
+                }
+            });
+            div.appendChild(btn);
+        } catch {}
+        
+        chatContainer.appendChild(div);
+    });
+    chatContainer.scrollTop = chatContainer.scrollHeight;
+}
+
+// 添加系统信息消息
+function addSystemMessage(content, type = 'system-info') {
+    const div = document.createElement('div');
+    div.className = `message ${type}`;
+    div.textContent = content;
+    chatContainer.appendChild(div);
+    chatContainer.scrollTop = chatContainer.scrollHeight;
+}
+
+
+// 获取聊天历史
+async function fetchHistory() {
+    try {
+        const res = await fetch(`/history?user_id=${encodeURIComponent(userId)}&session_id=${encodeURIComponent(sessionId)}`);
+        const data = await res.json();
+        history = data.history || [];
+        renderMessages();
+    } catch (err) {
+        console.error('Failed to fetch history', err);
+    }
+}
+
+// 开始新对话
+function startNewChat() {
+    sessionId = 'session-' + Date.now() + '-' + Math.random().toString(36).substring(2, 8);
+    localStorage.setItem('groqchat_session_id', sessionId);
+    history = [];
+    renderMessages();
+    console.log('New chat:', sessionId);
+}
+
+// 简化：无智能模式
+
+// 发送消息
+// (replaced by streaming version below)
+
+let currentAbortController = null;
+let isStreaming = false;
+async function sendMessage() {
+    if (isStreaming) return;
+    const message = input.value; // do not trim; show exactly what user typed
+    if (!message) return;
+    // 简化：无需模型选择
+    history.push({ role: 'user', content: message });
+    renderMessages();
+    input.value = '';
+    const assistantMsg = { role: 'assistant', content: '', provider: 'rr' };
+    history.push(assistantMsg);
+    renderMessages();
+    const assistantNodes = [...chatContainer.querySelectorAll('.message.assistant')];
+    const currentAssistantEl = assistantNodes[assistantNodes.length-1];
+    // Always update only the content area to preserve speaker header
+    const contentDiv = currentAssistantEl.querySelector('.message-content') || currentAssistantEl;
+    const endpoint = '/rr-chat/stream';
+    const body = { user_id:userId, session_id:sessionId, message };
+    currentAbortController = new AbortController();
+    isStreaming = true; sendBtn.disabled = false; // allow stop
+    sendBtn.textContent='🟥 Stop';
+    try {
+        const resp = await fetch(endpoint,{ method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body), signal: currentAbortController.signal });
+        if(!resp.ok||!resp.body) throw new Error('Network error');
+    const reader = resp.body.getReader(); const decoder = new TextDecoder(); let buf=''; let acc='';
+        while(true){
+            const {value,done}=await reader.read(); if(done) break;
+            buf+=decoder.decode(value,{stream:true});
+            const parts=buf.split('\n\n'); buf=parts.pop();
+            for(const p of parts){
+                const lines = p.split('\n').filter(l=>l.startsWith('data:'));
+                if (lines.length === 0) continue;
+                const jsonStr = lines.map(l=> l.startsWith('data: ') ? l.slice(6) : l.slice(5)).join('\n');
+                let evt = null; try { evt = JSON.parse(jsonStr); } catch { continue; }
+                if (!evt || typeof evt !== 'object') continue;
+                if (evt.type === 'done') { finalizeStream(acc,contentDiv,assistantMsg); endStreaming(); return; }
+                if (evt.type === 'rate_limited') { addSystemMessage('⏱ Too many requests. Please try again later','system-info'); if(!assistantMsg.content){ contentDiv.innerText='(Empty response)'; } endStreaming(); return; }
+                if (evt.type === 'error') { addSystemMessage('❌ Error: '+(evt.message||'unknown'),'system-info'); if(!assistantMsg.content){ contentDiv.innerText='(Empty response)'; } endStreaming(); return; }
+                if (evt.type === 'provider') {
+                    const prov = evt.provider || 'unknown';
+                    assistantMsg.provider = prov;
+                    const speaker = currentAssistantEl.querySelector('.speaker-info');
+                    if (speaker) speaker.textContent = `🤖 ${prov}`;
+                    continue;
+                }
+                if (evt.type === 'delta' && typeof evt.content === 'string') {
+                    acc = acc + evt.content; assistantMsg.content=acc;
+                    contentDiv.innerHTML = renderMarkdown(acc);
+                    queueMicrotask(() => { try { enhanceCodeBlocks(contentDiv); } catch(e) {} });
+                    chatContainer.scrollTop=chatContainer.scrollHeight;
+                    continue;
+                }
+                if (evt.type === 'usage') {
+                    // Could render token info somewhere, or ignore silently
+                    continue;
+                }
+            }
+        }
+        finalizeStream(acc,contentDiv,assistantMsg);
+    }
+    catch(e){ console.error(e); addSystemMessage('❌ Streaming failed: '+e.message,'system-info'); }
+    finally{ endStreaming(); }
+}
+function finalizeStream(text, contentDiv, assistantMsg){ assistantMsg.content=text; contentDiv.innerHTML=renderMarkdown(text||'(Empty response)'); queueMicrotask(() => { try { enhanceCodeBlocks(contentDiv); } catch(e) {} }); chatContainer.scrollTop=chatContainer.scrollHeight; }
+function endStreaming(){ isStreaming=false; sendBtn.disabled=false; sendBtn.textContent='📤 Send'; currentAbortController=null; }
+function cancelStreaming(){ if(currentAbortController){ currentAbortController.abort(); addSystemMessage('⛔ Cancelled current streaming request','system-info');
+    // If nothing streamed yet, mark the assistant bubble as cancelled content
+    const assistantNodes = [...chatContainer.querySelectorAll('.message.assistant')];
+    const currentAssistantEl = assistantNodes[assistantNodes.length-1];
+    const contentDiv = currentAssistantEl?.querySelector?.('.message-content') || currentAssistantEl;
+    const last = history[history.length-1];
+    if (last && last.role==='assistant' && !last.content) { if(contentDiv) contentDiv.innerText='(Cancelled)'; }
+    endStreaming(); }}
+// 事件绑定
+sendBtn.addEventListener('click', () => { if (isStreaming) { cancelStreaming(); } else { sendMessage(); }});
+newChatBtn.addEventListener('click', startNewChat);
+copyLastUserBtn.addEventListener('click', () => copyLastByRole('user'));
+copyLastAssistantBtn.addEventListener('click', () => copyLastByRole('assistant'));
+
+input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        sendMessage();
+    }
+});
+
+// 自动调整textarea高度
+input.addEventListener('input', () => {
+    input.style.height = 'auto';
+    input.style.height = Math.min(input.scrollHeight, 120) + 'px';
+});
+
+
+
+// 初始化
+fetchHistory();
+
+// Welcome message
+setTimeout(() => {
+    addSystemMessage('Welcome to round-robin chat: fixed order Groq → Mistral → DeepSeek, with token count at the end.', 'system-info');
+}, 500);
+</script>
+
+<!-- Copy helpers for global buttons -->
+<script>
+async function copyTextWithFallback(text, btn){
+    if (!btn) return;
+    const check = '\n<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg>';
+    const old = btn.innerHTML;
+    try { await navigator.clipboard.writeText(text); btn.innerHTML = check; }
+    catch {
+        const ta = document.createElement('textarea'); ta.value = text; document.body.appendChild(ta); ta.select();
+        try { document.execCommand('copy'); } finally { document.body.removeChild(ta); }
+        btn.innerHTML = check;
+    }
+    setTimeout(()=>{ btn.innerHTML = old; }, 1200);
+}
+
+function copyLastByRole(role){
+    // Find last message of given role
+    for (let i = history.length - 1; i >= 0; i--) {
+        const m = history[i];
+        if (m && m.role === role && m.content && m.content.trim().length > 0) {
+            const text = m.content;
+            const btn = role === 'assistant' ? copyLastAssistantBtn : copyLastUserBtn;
+            copyTextWithFallback(text, btn);
+            return;
+        }
+    }
+}
+</script>
+
+<!-- Local highlighting hooks (simple fallback only) -->
+<script>
+function enhanceCodeBlocks(root){
+    const container = root instanceof Element ? root : document;
+    const blocks = container.querySelectorAll('pre > code, pre code');
+        blocks.forEach(code => {
+        const pre = code.closest('pre');
+        if (!pre || pre.dataset.enhanced === '1') return;
+        // Insert copy button once
+        if (!pre.querySelector('.copy-btn')){
+            const btn = document.createElement('button');
+            btn.className = 'copy-btn';
+            btn.setAttribute('aria-label','复制代码');
+            btn.setAttribute('title','复制代码');
+            const icon = '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/><path d="M9 5h4"/></svg>';
+            const check = '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg>';
+            btn.innerHTML = icon;
+            btn.addEventListener('click', async () => {
+                try {
+                    await navigator.clipboard.writeText(code.innerText);
+                    const old = btn.innerHTML; btn.innerHTML = check; btn.setAttribute('aria-label','已复制');
+                    setTimeout(()=>{ btn.innerHTML = icon; btn.setAttribute('aria-label','复制代码'); }, 1200);
+                } catch {
+                    // Fallback: textarea hack
+                    const ta = document.createElement('textarea');
+                    ta.value = code.innerText; document.body.appendChild(ta); ta.select();
+                    try { document.execCommand('copy'); } finally { document.body.removeChild(ta); }
+                    const old = btn.innerHTML; btn.innerHTML = check; btn.setAttribute('aria-label','已复制');
+                    setTimeout(()=>{ btn.innerHTML = icon; btn.setAttribute('aria-label','复制代码'); }, 1200);
+                }
+            });
+            pre.appendChild(btn);
+        }
+                pre.dataset.enhanced = '1';
+
+        // Only fallback highlighter to keep example minimal
+        simpleFallbackHighlight(code);
+    });
+}
+
+// Very small fallback highlighter for common snippets (no external libs)
+function simpleFallbackHighlight(codeEl){
+    const cls = codeEl.className || '';
+    if (codeEl.dataset.fallbackHighlighted === '1') return; // guard
+    const lang = (cls.match(/language-([a-z0-9]+)/i) || [,''])[1].toLowerCase();
+    const src = codeEl.innerText;
+    if (codeEl.querySelector('span')) return;
+
+    // Mask tokens on raw text, then escape, then restore as spans
+    let text = src;
+    const toks = []; // {cls, text}
+    // Encode placeholder IDs using letters only to avoid matching by number regex
+    function idEnc(n){
+        n = Number(n);
+        let s = '';
+        do { s = String.fromCharCode(65 + (n % 26)) + s; n = Math.floor(n / 26) - 1; } while (n >= 0);
+        return s; // A, B, ..., Z, AA, AB, ...
+    }
+    function idDec(s){
+        let n = 0; for (let i=0;i<s.length;i++){ n = n*26 + (s.charCodeAt(i)-65+1); }
+        return n-1;
+    }
+    const PH = (i)=>`\u0001${idEnc(i)}\u0002`;
+    function mask(re, tcls){ text = text.replace(re, (m)=>{ const id=toks.length; toks.push({cls:tcls, text:m}); return PH(id); }); }
+
+    const is = (a)=>a.test(lang);
+    if (is(/^(rust)$/)){
+        mask(/\/\*[\s\S]*?\*\//g, 'cmt');
+        mask(/\/\/.*$/gm, 'cmt');
+        mask(/"([^"\\]|\\.)*"/g, 'str');
+        mask(/\b(fn|let|mut|struct|enum|impl|pub|use|mod|match|if|else|for|while|loop|return|async|await|move|where|crate|super|Self|self)\b/g, 'kw');
+        mask(/\b\d+(?:_\d+)*(?:\.[0-9_]+)?\b/g, 'num');
+    } else if (is(/^(javascript|js|ts|typescript)$/)){
+        mask(/\/\*[\s\S]*?\*\//g, 'cmt');
+        mask(/\/\/.*$/gm, 'cmt');
+        mask(/"([^"\\]|\\.)*"|\'([^'\\]|\\.)*\'|`([\s\S]*?)`/g, 'str');
+        mask(/\b(const|let|var|function|return|if|else|for|while|class|extends|new|try|catch|finally|import|from|export|default|async|await|yield|this|super)\b/g, 'kw');
+        mask(/\b\d+(?:_\d+)*(?:\.[0-9_]+)?\b/g, 'num');
+    } else if (is(/^(python|py)$/)){
+        mask(/\"\"\"[\s\S]*?\"\"\"|\'\'\'[\s\S]*?\'\'\'/g, 'cmt');
+        mask(/#.*/g, 'cmt');
+        mask(/"([^"\\]|\\.)*"|\'([^'\\]|\\.)*\'/g, 'str');
+        mask(/\b(def|class|return|if|elif|else|for|while|try|except|finally|with|as|import|from|pass|break|continue|lambda|yield|global|nonlocal|assert|raise|in|is|and|or|not|True|False|None)\b/g, 'kw');
+        mask(/\b\d+(?:_\d+)*(?:\.[0-9_]+)?\b/g, 'num');
+    } else if (is(/^(go|golang)$/)){
+        mask(/\/\/.*$/gm, 'cmt');
+        mask(/"([^"\\]|\\.)*"|\'([^'\\]|\\.)*\'/g, 'str');
+        mask(/\b(func|var|const|type|struct|interface|package|import|return|if|else|for|range|switch|case|default|defer|go|select|break|continue|fallthrough|map|chan)\b/g, 'kw');
+        mask(/\b\d+(?:_\d+)*(?:\.[0-9_]+)?\b/g, 'num');
+    } else if (is(/^(c|h|cpp|hpp|c\+\+)$/)){
+        mask(/\/\*[\s\S]*?\*\//g, 'cmt');
+        mask(/\/\/.*$/gm, 'cmt');
+        mask(/"([^"\\]|\\.)*"|\'([^'\\]|\\.)*\'/g, 'str');
+        mask(/\b(int|char|float|double|void|short|long|signed|unsigned|const|static|extern|struct|enum|typedef|union|return|if|else|for|while|do|switch|case|default|break|continue|goto|sizeof|volatile|inline|class|template|typename|namespace|using|public|private|protected|virtual|override|new|delete|try|catch|throw)\b/g, 'kw');
+        mask(/\b\d+(?:_\d+)*(?:\.[0-9_]+)?\b/g, 'num');
+    } else if (is(/^(java)$/)){
+        mask(/\/\*[\s\S]*?\*\//g, 'cmt');
+        mask(/\/\/.*$/gm, 'cmt');
+        mask(/"([^"\\]|\\.)*"|\'([^'\\]|\\.)*\'/g, 'str');
+        mask(/\b(class|interface|enum|public|private|protected|static|final|abstract|synchronized|transient|volatile|native|strictfp|void|int|long|short|byte|char|float|double|boolean|if|else|for|while|do|switch|case|default|break|continue|return|try|catch|finally|throw|throws|extends|implements|new|this|super|package|import)\b/g, 'kw');
+        mask(/\b\d+(?:_\d+)*(?:\.[0-9_]+)?\b/g, 'num');
+    } else if (is(/^(json)$/)){
+        mask(/"([^"\\]|\\.)*"(?=\s*:)/g, 'kw');
+        mask(/"([^"\\]|\\.)*"/g, 'str');
+        mask(/\b(true|false|null)\b/g, 'kw');
+        mask(/\b-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?\b/g, 'num');
+    } else if (is(/^(bash|sh|shell)$/)){
+        mask(/#.*/g, 'cmt');
+        mask(/"([^"\\]|\\.)*"|\'([^'\\]|\\.)*\'/g, 'str');
+        mask(/\b(cd|ls|cat|echo|grep|find|export|set|unset|mkdir|rm|rmdir|cp|mv|tar|zip|unzip|chmod|chown|sudo|apt|yum|pacman|pwsh|powershell)\b/g, 'kw');
+        mask(/\b\d+(?:_\d+)*(?:\.[0-9_]+)?\b/g, 'num');
+    } else {
+        mask(/\/\*[\s\S]*?\*\//g, 'cmt');
+        mask(/\/\/.*$/gm, 'cmt');
+        mask(/"([^"\\]|\\.)*"|\'([^'\\]|\\.)*\'|`([\s\S]*?)`/g, 'str');
+        mask(/\b\d+(?:_\d+)*(?:\.[0-9_]+)?\b/g, 'num');
+    }
+
+    let html = escapeHtml(text);
+    // Restore new (letter-coded) placeholders
+    html = html.replace(/\u0001([A-Z]+)\u0002/g, (_, id)=>{
+        const t = toks[idDec(id)];
+        const content = escapeHtml(t.text);
+        const cls = t.cls === 'kw' ? 'token-kw' : t.cls === 'str' ? 'token-str' : t.cls === 'num' ? 'token-num' : 'token-cmt';
+        return `<span class="${cls}">${content}</span>`;
+    });
+    // Backward-compat: restore older numeric placeholders if any
+    html = html.replace(/\u0001(\d+)\u0002/g, (_, i)=>{
+        const t = toks[Number(i)];
+        if (!t) return '';
+        const content = escapeHtml(t.text);
+        const cls = t.cls === 'kw' ? 'token-kw' : t.cls === 'str' ? 'token-str' : t.cls === 'num' ? 'token-num' : 'token-cmt';
+        return `<span class="${cls}">${content}</span>`;
+    });
+
+    // Safety: if any placeholders remain, fall back to plain escaped HTML to avoid artifacts
+    if (html.indexOf('\u0001') !== -1 || html.indexOf('\u0002') !== -1) {
+        html = escapeHtml(src);
+    }
+    codeEl.innerHTML = html;
+    codeEl.dataset.fallbackHighlighted = '1';
+}
+
+function escapeHtml(s){
+    return s.replace(/[&<>\"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;','\'':'&#39;'}[c]));
+}
+
+// Observe chat container for dynamic additions (streaming)
+try {
+    const target = document.getElementById('chat-container');
+    if (target) {
+        const mo = new MutationObserver(() => { try { enhanceCodeBlocks(target); } catch(e) {} });
+        mo.observe(target, { childList: true, subtree: true });
+        // initial pass
+        enhanceCodeBlocks(target);
+    }
+} catch {}
+</script>
+</body>
+</html>
