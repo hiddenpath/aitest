@@ -306,6 +306,30 @@ body {
     font-weight: 600;
 }
 
+.usage-info {
+    margin-top: 10px;
+    padding-top: 10px;
+    border-top: 1px dashed rgba(0,0,0,0.08);
+    font-size: 12px;
+    color: #6b7280;
+    display: flex;
+    gap: 10px;
+    flex-wrap: wrap;
+    align-items: center;
+}
+.usage-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 8px;
+    border-radius: 999px;
+    background: rgba(102, 126, 234, 0.08);
+    border: 1px solid rgba(102, 126, 234, 0.18);
+    color: #4a5568;
+    font-weight: 600;
+}
+.usage-muted { font-weight: 500; opacity: 0.85; }
+
 @media (max-width: 768px) {
     #input-area { padding: 16px; }
 }
@@ -393,6 +417,56 @@ if (!sessionId) {
 let history = [];
 // 简化：固定后端轮询，无需智能模式
 
+function ensureUsageEl(messageEl){
+    if (!messageEl) return null;
+    let el = messageEl.querySelector('.usage-info');
+    if (el) return el;
+    const contentDiv = messageEl.querySelector('.message-content') || messageEl;
+    el = document.createElement('div');
+    el.className = 'usage-info';
+    // Insert after content
+    contentDiv.insertAdjacentElement('afterend', el);
+    return el;
+}
+
+function formatUsage(evt){
+    if (!evt || typeof evt !== 'object') return '';
+    // Backward compatibility: older servers may only send tokens/accurate.
+    const prompt = (typeof evt.prompt_tokens === 'number') ? evt.prompt_tokens : null;
+    const completion = (typeof evt.completion_tokens === 'number') ? evt.completion_tokens : null;
+    const total = (typeof evt.total_tokens === 'number') ? evt.total_tokens
+        : (typeof evt.tokens === 'number') ? evt.tokens : null;
+
+    const accurateTotal = (typeof evt.accurate_total === 'boolean') ? evt.accurate_total
+        : (typeof evt.accurate === 'boolean') ? evt.accurate : false;
+    const accurateBreakdown = (typeof evt.accurate_breakdown === 'boolean') ? evt.accurate_breakdown : false;
+
+    let quality = 'estimated';
+    if (accurateTotal && accurateBreakdown) quality = 'provider';
+    else if (accurateTotal && !accurateBreakdown) quality = 'total provider, breakdown estimated';
+
+    const parts = [];
+    if (prompt != null) parts.push(`prompt ${prompt}`);
+    if (completion != null) parts.push(`completion ${completion}`);
+    if (total != null) parts.push(`total ${total}`);
+    if (parts.length === 0) return '';
+
+    return { parts, quality, accurateTotal, accurateBreakdown };
+}
+
+function renderUsageInto(messageEl, evt){
+    const info = formatUsage(evt);
+    if (!info) return;
+    const el = ensureUsageEl(messageEl);
+    if (!el) return;
+    const { parts, quality } = info;
+    el.innerHTML = `
+        <span class="usage-pill">Usage</span>
+        <span class="usage-muted">${parts.join(' • ')}</span>
+        <span class="usage-muted">(${quality})</span>
+    `;
+}
+
 // Render chat messages
 function renderMessages() {
     chatContainer.innerHTML = '';
@@ -413,6 +487,9 @@ function renderMessages() {
             const contentHtml = msg.content ? renderMarkdown(msg.content) : '';
             div.innerHTML = speakerInfo + `<div class="message-content markdown-content">${contentHtml}</div>`;
             queueMicrotask(() => { try { enhanceCodeBlocks(div); } catch(e) { console.warn('enhanceCodeBlocks failed', e); } });
+            if (msg.usage) {
+                renderUsageInto(div, msg.usage);
+            }
         } else {
             const userContent = msg.content.replace(/\n/g, '<br>');
             div.innerHTML = speakerInfo + `<div class="message-content">${userContent}</div>`;
@@ -541,7 +618,9 @@ async function sendMessage() {
                     continue;
                 }
                 if (evt.type === 'usage') {
-                    // Could render token info somewhere, or ignore silently
+                    // Persist on the current assistant message and render under the bubble
+                    assistantMsg.usage = evt;
+                    renderUsageInto(currentAssistantEl, evt);
                     continue;
                 }
             }

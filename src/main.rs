@@ -1,5 +1,4 @@
-use ai_lib::metrics::Metrics;
-use ai_lib::{AiClient, AiClientBuilder, ChatCompletionRequest, Message, Provider};
+use ai_lib_rust::{AiClient, AiClientBuilder, Message, StreamingEvent};
 use axum::body::Body;
 use axum::http::{HeaderValue, Method};
 use axum::{
@@ -20,8 +19,7 @@ use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use tower_http::{cors::CorsLayer, timeout::TimeoutLayer};
 mod app_metrics;
-use crate::app_metrics::SimpleMetrics;
-use ai_lib::types::{Usage, UsageStatus};
+use crate::app_metrics::{Metrics, SimpleMetrics};
 
 // App state
 pub struct AppState {
@@ -30,7 +28,7 @@ pub struct AppState {
     pub rr_index: AtomicUsize,
     pub start_time: Instant,
     pub rate_limits: tokio::sync::RwLock<HashMap<String, Vec<Instant>>>,
-    pub metrics: Arc<dyn Metrics>,
+    pub metrics: Arc<SimpleMetrics>,
 }
 
 // Request/response types
@@ -53,6 +51,18 @@ struct HistoryMessage {
     content: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct TokenUsageSummary {
+    // Provider-supplied (if available)
+    prompt_tokens: usize,
+    completion_tokens: usize,
+    total_tokens: usize,
+
+    // Accuracy flags
+    accurate_total: bool,
+    accurate_breakdown: bool,
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Initialize database (default path if env not provided)
@@ -61,48 +71,58 @@ async fn main() -> anyhow::Result<()> {
     let db = SqlitePool::connect(&db_url).await?;
     sqlx::query("CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT, session_id TEXT, role TEXT, content TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)").execute(&db).await?;
 
-    // Initialize AI clients (3 fixed providers)
+    // Initialize AI clients (runtime style: model_id driven)
     let mut clients = Vec::new();
-    let providers = [
-        ("groq", Provider::Groq, "GROQ_API_KEY"),
-        ("mistral", Provider::Mistral, "MISTRAL_API_KEY"),
-        ("deepseek", Provider::DeepSeek, "DEEPSEEK_API_KEY"),
+    // Canonical model ids (provider/model). Provider auth is resolved automatically via:
+    // 1) OS keyring entry ("ai-protocol", provider_id)
+    // 2) env var: <PROVIDER_ID>_API_KEY (e.g., GROQ_API_KEY)
+    let profiles: [(&str, &str); 3] = [
+        // NOTE: Groq deprecates models over time; prefer the newer Llama 3.3 series.
+        ("groq", "groq/llama-3.3-70b-versatile"),
+        ("mistral", "mistral/mistral-large-latest"),
+        ("deepseek", "deepseek/deepseek-chat"),
     ];
 
-    for (name, provider, env_key) in providers {
-        match std::env::var(env_key) {
-            Ok(key) => {
-                let key_preview = if key.len() > 10 { &key[..10] } else { &key };
-                println!("🔑 {} found: {}...", env_key, key_preview);
-            }
-            Err(_) => {
-                println!("⚠️ {} not set, skipping {}", env_key, name);
-                continue;
-            }
+    for (name, primary_model) in profiles {
+        let provider_env = provider_api_key_env(primary_model);
+        if std::env::var(&provider_env).is_ok() {
+            println!("🔑 {} found for {}", provider_env, name);
+        } else {
+            println!(
+                "ℹ️ {} not set for {} (OK if keyring is configured), continuing",
+                provider_env, name
+            );
         }
-        if std::env::var(env_key).is_ok() {
-            // Build failover chain for each provider
-            let failover_chain: Vec<Provider> = match provider {
-                Provider::Groq => vec![provider, Provider::Mistral, Provider::DeepSeek],
-                Provider::Mistral => vec![provider, Provider::Groq, Provider::DeepSeek],
-                Provider::DeepSeek => vec![provider, Provider::Groq, Provider::Mistral],
-                _ => vec![provider, Provider::DeepSeek],
-            };
 
-            // Use ai-lib's simplified failover chain API
-            // Proxy is automatically picked up from AI_PROXY_URL environment variable
-            let mut builder = AiClientBuilder::new(provider).with_timeout(Duration::from_secs(180));
+        // Build failover chain for each provider using model ids.
+        // Order: primary first, then fallbacks.
+        let failover_models: Vec<String> = match name {
+            "groq" => vec![
+                primary_model.to_string(),
+                "mistral/mistral-large-latest".to_string(),
+                "deepseek/deepseek-chat".to_string(),
+            ],
+            "mistral" => vec![
+                primary_model.to_string(),
+                "groq/llama-3.3-70b-versatile".to_string(),
+                "deepseek/deepseek-chat".to_string(),
+            ],
+            "deepseek" => vec![
+                primary_model.to_string(),
+                "groq/llama-3.3-70b-versatile".to_string(),
+                "mistral/mistral-large-latest".to_string(),
+            ],
+            _ => vec![primary_model.to_string()],
+        };
 
-            // Only set proxy explicitly if PROXY_URL is set (overrides AI_PROXY_URL)
-            if let Ok(proxy) = std::env::var("PROXY_URL") {
-                builder = builder.with_proxy(Some(&proxy));
-            }
+        // Runtime builder: keep API surface small; configure with env if needed:
+        // - Protocol resolution: AI_PROTOCOL_DIR / AI_PROTOCOL_PATH (or defaults, including D:\ai-protocol\...)
+        // - Proxy: AI_PROXY_URL
+        let builder = AiClientBuilder::new().with_fallbacks(failover_models[1..].to_vec());
+        let client = builder.build(&failover_models[0]).await?;
 
-            let client = builder.with_failover_chain(failover_chain)?.build()?;
-
-            clients.push((name.to_string(), Arc::new(client)));
-            println!("✅ {} client initialized with failover", name);
-        }
+        clients.push((name.to_string(), Arc::new(client)));
+        println!("✅ {} client initialized with fallover", name);
     }
 
     if clients.is_empty() {
@@ -360,9 +380,6 @@ async fn rr_chat_stream(
     let idx = state.rr_index.fetch_add(1, Ordering::Relaxed) % state.clients.len();
     let (provider_name, client) = &state.clients[idx];
 
-    // Use ai-lib's default for the active provider; can override with *_MODEL env vars.
-    let model = client.default_chat_model();
-
     let state_clone = state.clone();
     let user_id = payload.user_id.clone();
     let session_id = payload.session_id.clone();
@@ -375,14 +392,23 @@ async fn rr_chat_stream(
         let prov_evt = json!({"type":"provider","provider": provider_name});
         yield format!("data: {}\n\n", prov_evt.to_string());
 
-        let req = ChatCompletionRequest::new(model.clone(), messages)
-            .with_temperature(0.7)
-            .with_max_tokens(4096);
+        // Runtime chat: builder-based request (no Provider enum, no SDK request structs).
+        // Keep a copy for token estimation after the stream completes.
+        let messages_for_usage = messages.clone();
+        let build_stream = client
+            .chat()
+            .messages(messages)
+            .temperature(0.7)
+            .max_tokens(4096)
+            .stream()
+            .execute_stream();
 
         // timeouts: 420s for entire request, 300s between chunks (DeepSeek can be very slow)
-    match tokio::time::timeout(Duration::from_secs(420), client.chat_completion_stream(req.clone())).await {
+        use futures::StreamExt;
+        match tokio::time::timeout(Duration::from_secs(420), build_stream).await {
             Ok(Ok(mut s)) => {
                 let mut full_response = String::new();
+                let mut usage_data: Option<serde_json::Value> = None;
                 let mut chunk_timeout = tokio::time::interval(Duration::from_secs(300));
                 chunk_timeout.tick().await; // skip the first immediate tick
 
@@ -390,14 +416,29 @@ async fn rr_chat_stream(
                     tokio::select! {
                         chunk_result = s.next() => {
                             match chunk_result {
-                                Some(Ok(c)) => {
-                                    if let Some(delta) = c.choices.first().and_then(|ch| ch.delta.content.clone()) {
-                                        if !delta.is_empty() {
-                                            full_response.push_str(&delta);
-                                            let evt = json!({"type":"delta","content": delta});
-                                            yield format!("data: {}\n\n", evt.to_string());
-                                            chunk_timeout.reset();
+                                Some(Ok(event)) => {
+                                    match event {
+                                        StreamingEvent::PartialContentDelta { content, .. } => {
+                                            if !content.is_empty() {
+                                                full_response.push_str(&content);
+                                                let evt = json!({"type":"delta","content": content});
+                                                yield format!("data: {}\n\n", evt.to_string());
+                                                chunk_timeout.reset();
+                                            }
                                         }
+                                        StreamingEvent::Metadata { usage, .. } => {
+                                            usage_data = usage;
+                                        }
+                                        StreamingEvent::StreamEnd { .. } => {
+                                            break;
+                                        }
+                                        StreamingEvent::StreamError { error, .. } => {
+                                            metrics.incr_counter("ai_errors_total", 1).await;
+                                            let evt = json!({"type":"error","message": format!("Stream error: {}", error)});
+                                            yield format!("data: {}\n\n", evt.to_string());
+                                            break;
+                                        }
+                                        _ => {} // Ignore other event types (ThinkingDelta, ToolCallStarted, etc.)
                                     }
                                 }
                                 Some(Err(e)) => {
@@ -417,22 +458,44 @@ async fn rr_chat_stream(
                     }
                 }
 
-                // Save history
-                let _ = save_chat_history(&state_clone.db, &user_id, &session_id, &user_message, &full_response).await;
+                // Check for empty response and log warning
+                if full_response.is_empty() {
+                    metrics.incr_counter("ai_errors_total", 1).await;
+                    let evt = json!({"type":"warning","message": "Received empty response from provider (stream ended with no content)"});
+                    yield format!("data: {}\n\n", evt.to_string());
+                }
+
+                // Save history (only if response is not empty)
+                if !full_response.is_empty() {
+                    let _ = save_chat_history(&state_clone.db, &user_id, &session_id, &user_message, &full_response).await;
+                }
 
                 // Token accounting: prefer provider usage if provided; else local estimate
-                // Streaming usually lacks usage; keep None to estimate locally
-                let (tokens, accurate) = estimate_tokens(None, &full_response);
-                if accurate {
-                    metrics.incr_counter("ai_tokens_used_accurate", tokens as u64).await;
+                let usage = estimate_tokens(usage_data, &messages_for_usage, &full_response);
+                if usage.accurate_total {
+                    metrics
+                        .incr_counter("ai_tokens_used_accurate", usage.total_tokens as u64)
+                        .await;
                 } else {
-                    metrics.incr_counter("ai_tokens_used_estimated", tokens as u64).await;
+                    metrics
+                        .incr_counter("ai_tokens_used_estimated", usage.total_tokens as u64)
+                        .await;
                 }
-                let usage_evt = json!({"type":"usage","tokens": tokens, "accurate": accurate});
+                // Backward-compatible: keep `tokens`/`accurate` while adding breakdown.
+                let usage_evt = json!({
+                    "type":"usage",
+                    "tokens": usage.total_tokens,
+                    "accurate": usage.accurate_total,
+                    "prompt_tokens": usage.prompt_tokens,
+                    "completion_tokens": usage.completion_tokens,
+                    "total_tokens": usage.total_tokens,
+                    "accurate_total": usage.accurate_total,
+                    "accurate_breakdown": usage.accurate_breakdown
+                });
                 yield format!("data: {}\n\n", usage_evt.to_string());
             }
             Ok(Err(e)) => {
-                // Let ai-lib's configured failover handle retryable errors.
+                // Let ai-lib-rust's configured failover handle retryable errors.
                 // Record the error and surface a short message to the client.
                 metrics.incr_counter("ai_errors_total", 1).await;
                 let evt = json!({"type":"error","message": format!("Stream init failed: {}", e)});
@@ -479,6 +542,10 @@ async fn build_message_sequence(
     )];
 
     for msg in history.into_iter().rev() {
+        // Skip empty messages to avoid invalid assistant messages (e.g., Mistral requires content or tool_calls)
+        if msg.content.is_empty() {
+            continue;
+        }
         if msg.role == "user" {
             messages.push(Message::user(msg.content));
         } else {
@@ -524,32 +591,108 @@ async fn save_chat_history(
 }
 
 /// Compute token count and whether it is provider-supplied (accurate) or locally estimated.
-/// - If (usage, status) present and status is Finalized/Estimated with total_tokens>0, return that;
-/// - If Pending/Unsupported or missing/zero, fall back to local estimate.
-fn estimate_tokens(usage_and_status: Option<(Usage, UsageStatus)>, s: &str) -> (usize, bool) {
-    if let Some((usage, status)) = usage_and_status {
-        match status {
-            // Only Finalized is considered accurate (ACU)
-            UsageStatus::Finalized => {
-                if usage.total_tokens > 0 {
-                    return (usage.total_tokens as usize, true);
-                }
+/// - If usage JSON is present with total_tokens>0, return that (marked as accurate);
+/// - Otherwise, fall back to local estimate.
+fn estimate_tokens(
+    usage_data: Option<serde_json::Value>,
+    messages: &[Message],
+    assistant_text: &str,
+) -> TokenUsageSummary {
+    // 1) Prefer provider-supplied usage fields (prompt/completion/total)
+    if let Some(usage) = usage_data {
+        let prompt = usage
+            .get("prompt_tokens")
+            .or_else(|| usage.get("promptTokens"))
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize);
+
+        let completion = usage
+            .get("completion_tokens")
+            .or_else(|| usage.get("completionTokens"))
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize);
+
+        let total = usage
+            .get("total_tokens")
+            .or_else(|| usage.get("totalTokens"))
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize);
+
+        // If we have full breakdown, it's accurate.
+        if let (Some(p), Some(c), Some(t)) = (prompt, completion, total) {
+            if t > 0 {
+                return TokenUsageSummary {
+                    prompt_tokens: p,
+                    completion_tokens: c,
+                    total_tokens: t,
+                    accurate_total: true,
+                    accurate_breakdown: true,
+                };
             }
-            // Estimated: still use it but mark as EST (accurate=false)
-            UsageStatus::Estimated => {
-                if usage.total_tokens > 0 {
-                    return (usage.total_tokens as usize, false);
-                }
-            }
-            UsageStatus::Pending | UsageStatus::Unsupported => {
-                // fall through to local estimate
-            }
+        }
+
+        // If we only have total, keep total as accurate but estimate breakdown.
+        if let Some(t) = total.filter(|t| *t > 0) {
+            let est_completion = estimate_text_tokens(assistant_text);
+            let est_prompt = t.saturating_sub(est_completion);
+            return TokenUsageSummary {
+                prompt_tokens: est_prompt,
+                completion_tokens: est_completion,
+                total_tokens: t,
+                accurate_total: true,
+                accurate_breakdown: false,
+            };
         }
     }
 
-    // Local estimate
-    let mut tokens = 0;
-    let mut ascii_run = 0;
+    // 2) Local estimation fallback (both prompt + completion)
+    let prompt_text = messages_text_for_estimation(messages);
+    let prompt_tokens = estimate_text_tokens(&prompt_text);
+    let completion_tokens = estimate_text_tokens(assistant_text);
+    TokenUsageSummary {
+        prompt_tokens,
+        completion_tokens,
+        total_tokens: prompt_tokens.saturating_add(completion_tokens),
+        accurate_total: false,
+        accurate_breakdown: false,
+    }
+}
+
+fn messages_text_for_estimation(messages: &[Message]) -> String {
+    // Best-effort: count only textual content.
+    // For multimodal blocks (image/audio), we don't try to estimate tokenization cost here.
+    let mut out = String::new();
+    for m in messages {
+        out.push_str(&format!("{:?}: ", m.role));
+        match &m.content {
+            ai_lib_rust::types::message::MessageContent::Text(t) => {
+                out.push_str(t);
+            }
+            ai_lib_rust::types::message::MessageContent::Blocks(blocks) => {
+                for b in blocks {
+                    match b {
+                        ai_lib_rust::types::message::ContentBlock::Text { text } => {
+                            out.push_str(text);
+                            out.push('\n');
+                        }
+                        _ => {
+                            // ignore non-text blocks in estimation
+                        }
+                    }
+                }
+            }
+        }
+        out.push('\n');
+    }
+    out
+}
+
+fn estimate_text_tokens(s: &str) -> usize {
+    // Simple heuristic:
+    // - ASCII: ~4 chars per token
+    // - Non-ASCII: ~1 char per token
+    let mut tokens = 0usize;
+    let mut ascii_run = 0usize;
 
     for ch in s.chars() {
         if ch.is_ascii() {
@@ -567,46 +710,21 @@ fn estimate_tokens(usage_and_status: Option<(Usage, UsageStatus)>, s: &str) -> (
         tokens += (ascii_run + 3) / 4;
     }
 
-    (tokens, false)
+    tokens
+}
+
+fn provider_api_key_env(model_id: &str) -> String {
+    let provider = model_id.split('/').next().unwrap_or(model_id);
+    format!("{}_API_KEY", provider.to_uppercase())
 }
 
 // Simple validation function for fixed code examples
 #[allow(dead_code)]
 fn validate_fixed_examples() {
-    // Test Tool construction (fixed from getting-started.md)
-    use ai_lib::types::function_call::Tool;
-
-    let _tool = Tool {
-        name: "get_weather".to_string(),
-        description: Some("Get current weather information".to_string()),
-        parameters: Some(json!({
-            "type": "object",
-            "properties": {
-                "location": {"type": "string", "description": "City name"}
-            },
-            "required": ["location"]
-        }))
-    };
-
-    // Test Content construction methods
-    use ai_lib::Content;
-    let _text_content = Content::new_text("Hello world".to_string());
-    let _image_content = Content::new_image(
-        Some("https://example.com/image.jpg".to_string()),
-        Some("image/jpeg".to_string()),
-        Some("image.jpg".to_string()),
-    );
-
-    // Test ChatCompletionRequest construction
-    use ai_lib::{ChatCompletionRequest, Message, Role};
-    let _request = ChatCompletionRequest::new(
-        "gpt-4o".to_string(),
-        vec![Message {
-            role: Role::User,
-            content: Content::new_text("Hello, how are you?".to_string()),
-            function_call: None,
-        }]
-    );
+    // Test Message construction
+    let _user_msg = Message::user("Hello, how are you?");
+    let _system_msg = Message::system("You are a helpful assistant.");
+    let _assistant_msg = Message::assistant("I'm doing well, thank you!");
 
     println!("All fixed code examples compile successfully!");
 }
