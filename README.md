@@ -1,20 +1,30 @@
-# ai-lib Axum Example: Round-robin Chat across 3 Providers
+# ai-lib-rust Axum Example: DeepSeek Streaming Chat (Phase 1)
 
-This is a minimal, production-lean example showing how to integrate `ai-lib` with an Axum web server and a simple, single-file frontend. It demonstrates:
+This is a minimal, production-lean example showing how to integrate `ai-lib-rust` with an Axum web server and a simple, single-file frontend. Phase 1 demonstrates:
 
-- A unified client interface to multiple providers (Groq, Mistral, DeepSeek)
-- Round-robin routing per request (one provider per request, rotating)
+- A unified client interface to a single provider (DeepSeek)
 - Server-Sent Events (SSE) streaming
 - SQLite-backed chat history
 - Basic rate limiting and safety checks
-- Pluggable metrics via `ai-lib::metrics::Metrics` trait
+- Pluggable metrics via a local `Metrics` trait (`src/app_metrics.rs`)
 
-It is intentionally simple, focusing on clarity and correctness rather than “smart routing.” Use it to verify that ai-lib is not “Groq-only” and that Axum integration is straightforward.
+It is intentionally simple, focusing on clarity and correctness rather than “smart routing.” The goal is to first ensure basic streaming chat works end-to-end with one provider, then add more providers incrementally.
 
 ## What this example is (and isn’t)
 
-- Is: a small Axum app that streams chat completions from three providers in a round-robin fashion, with a clean `ai-lib` integration.
+- Is: a small Axum app that streams chat completions from a **single provider (DeepSeek)** with a clean `ai-lib-rust` integration.
 - Is not: a full “smart router,” multi-provider merge, or cost optimizer. Those are easy to build on top, but omitted here to keep the example focused and auditable.
+
+## 构建说明（中文 / Mingw）
+
+使用**本地 mingw 工具链**编译时，请执行：
+
+```powershell
+rustup run stable-x86_64-pc-windows-gnu cargo build
+```
+
+若已 `rustup default stable-x86_64-pc-windows-gnu`，可直接 `cargo build`。  
+环境变量、运行方式及与 ai-lib-rust 的对接说明见 **[构建说明.md](./构建说明.md)**。
 
 ## Prerequisites
 
@@ -23,12 +33,10 @@ It is intentionally simple, focusing on clarity and correctness rather than “s
 
 ## Configure environment
 
-Set at least one provider API key; any subset is fine. The app only initializes clients for providers whose keys are present.
+Set the DeepSeek API key.
 
 ```bash
 # Windows PowerShell (example)
-$env:GROQ_API_KEY = "..."
-$env:MISTRAL_API_KEY = "..."
 $env:DEEPSEEK_API_KEY = "..."
 
 # Optional proxy (example)
@@ -40,7 +48,8 @@ $env:DATABASE_URL = "sqlite:///path/to/chat.db"
 
 Notes:
 - The example prefers `PROXY_URL`, and will also fall back to `AI_PROXY_URL` if set.
-- If no API keys are present, the server refuses to start.
+- If DeepSeek auth is not configured (env or keyring), requests will fail.
+- Optional: override model id via `DEEPSEEK_MODEL_ID` or `MODEL_ID` (default: `deepseek/deepseek-chat`).
 
 ## Run
 
@@ -56,7 +65,7 @@ Visit `http://127.0.0.1:3000`.
 - `GET /health` – service health, uptime, and active providers
 - `GET /history?user_id=...&session_id=...` – latest 50 messages for a session
 - `POST /history` – same as GET but accepts JSON `{ user_id, session_id }`
-- `POST /rr-chat/stream` – SSE streaming chat (JSON events); request body:
+- `POST /chat/stream` – SSE streaming chat (JSON events); request body:
 
 ```json
 {
@@ -69,7 +78,7 @@ Visit `http://127.0.0.1:3000`.
 SSE event payloads (each event is a single JSON object sent via `data: { ... }`):
 
 ```json
-{ "type": "provider", "provider": "groq|mistral|deepseek" }
+{ "type": "provider", "provider": "deepseek" }
 { "type": "delta", "content": "partial text" }
 { "type": "usage", "tokens": 123, "accurate": false }
 { "type": "error", "message": "..." }
@@ -79,12 +88,12 @@ SSE event payloads (each event is a single JSON object sent via `data: { ... }`)
 
 See `SSE_EVENTS_SCHEMA.md` for the full schema and error-class guidance, and `TOKEN_ESTIMATION_PLUGGABLE.md` for a pluggable token estimator example.
 
-## How this uses ai-lib
+## How this uses ai-lib-rust
 
-- Each configured provider is instantiated via `AiClientBuilder`.
-- All requests use the unified `ChatCompletionRequest` model and `chat_completion_stream` API.
-- Failover (ai-lib 0.3.4): per-request cross-provider failover is configured. For example, if Groq is selected, the client will try Mistral then DeepSeek on retryable errors, transparently to the handler.
-- Metrics are recorded through a `Metrics` implementation (`src/app_metrics.rs`), which you can swap with a real backend.
+- DeepSeek is instantiated via `AiClientBuilder` (or `AiClient::new()`).
+- All requests use the unified runtime chat builder API (`client.chat()...stream().execute_stream()`).
+- Phase 1 intentionally avoids cross-provider routing/failover to keep behavior deterministic.
+- Metrics are recorded through a local `Metrics` implementation (`src/app_metrics.rs`), which you can swap with a real backend.
 
 ## Frontend
 

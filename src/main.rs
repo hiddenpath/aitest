@@ -11,10 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sqlx::SqlitePool;
 use std::collections::HashMap;
-use std::sync::{
-    atomic::{AtomicUsize, Ordering},
-    Arc,
-};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use tower_http::{cors::CorsLayer, timeout::TimeoutLayer};
@@ -24,8 +21,8 @@ use crate::app_metrics::{Metrics, SimpleMetrics};
 // App state
 pub struct AppState {
     pub db: SqlitePool,
-    pub clients: Vec<(String, Arc<AiClient>)>, // (provider_name, client)
-    pub rr_index: AtomicUsize,
+    pub provider_name: String,
+    pub client: Arc<AiClient>,
     pub start_time: Instant,
     pub rate_limits: tokio::sync::RwLock<HashMap<String, Vec<Instant>>>,
     pub metrics: Arc<SimpleMetrics>,
@@ -66,75 +63,37 @@ struct TokenUsageSummary {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Initialize database (default path if env not provided)
-    let db_url =
-        std::env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite://D:/ai_data/groqchat.db".into());
+    let db_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite://chat.db".into());
     let db = SqlitePool::connect(&db_url).await?;
     sqlx::query("CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT, session_id TEXT, role TEXT, content TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)").execute(&db).await?;
 
-    // Initialize AI clients (runtime style: model_id driven)
-    let mut clients = Vec::new();
-    // Canonical model ids (provider/model). Provider auth is resolved automatically via:
+    // Initialize a SINGLE provider: DeepSeek only.
+    // Canonical model id is provider/model. Auth is resolved automatically via:
     // 1) OS keyring entry ("ai-protocol", provider_id)
-    // 2) env var: <PROVIDER_ID>_API_KEY (e.g., GROQ_API_KEY)
-    let profiles: [(&str, &str); 3] = [
-        // NOTE: Groq deprecates models over time; prefer the newer Llama 3.3 series.
-        ("groq", "groq/llama-3.3-70b-versatile"),
-        ("mistral", "mistral/mistral-large-latest"),
-        ("deepseek", "deepseek/deepseek-chat"),
-    ];
+    // 2) env var: <PROVIDER_ID>_API_KEY (e.g., DEEPSEEK_API_KEY)
+    let provider_name = "deepseek".to_string();
+    let model_id = std::env::var("DEEPSEEK_MODEL_ID")
+        .or_else(|_| std::env::var("MODEL_ID"))
+        .unwrap_or_else(|_| "deepseek/deepseek-chat".to_string());
 
-    for (name, primary_model) in profiles {
-        let provider_env = provider_api_key_env(primary_model);
-        if std::env::var(&provider_env).is_ok() {
-            println!("🔑 {} found for {}", provider_env, name);
-        } else {
-            println!(
-                "ℹ️ {} not set for {} (OK if keyring is configured), continuing",
-                provider_env, name
-            );
-        }
-
-        // Build failover chain for each provider using model ids.
-        // Order: primary first, then fallbacks.
-        let failover_models: Vec<String> = match name {
-            "groq" => vec![
-                primary_model.to_string(),
-                "mistral/mistral-large-latest".to_string(),
-                "deepseek/deepseek-chat".to_string(),
-            ],
-            "mistral" => vec![
-                primary_model.to_string(),
-                "groq/llama-3.3-70b-versatile".to_string(),
-                "deepseek/deepseek-chat".to_string(),
-            ],
-            "deepseek" => vec![
-                primary_model.to_string(),
-                "groq/llama-3.3-70b-versatile".to_string(),
-                "mistral/mistral-large-latest".to_string(),
-            ],
-            _ => vec![primary_model.to_string()],
-        };
-
-        // Runtime builder: keep API surface small; configure with env if needed:
-        // - Protocol resolution: AI_PROTOCOL_DIR / AI_PROTOCOL_PATH (or defaults, including D:\ai-protocol\...)
-        // - Proxy: AI_PROXY_URL
-        let builder = AiClientBuilder::new().with_fallbacks(failover_models[1..].to_vec());
-        let client = builder.build(&failover_models[0]).await?;
-
-        clients.push((name.to_string(), Arc::new(client)));
-        println!("✅ {} client initialized with fallover", name);
+    let provider_env = provider_api_key_env(&model_id);
+    if std::env::var(&provider_env).is_ok() {
+        println!("🔑 {} found for {}", provider_env, provider_name);
+    } else {
+        println!(
+            "ℹ️ {} not set for deepseek (OK if keyring is configured), continuing",
+            provider_env
+        );
     }
 
-    if clients.is_empty() {
-        return Err(anyhow::anyhow!(
-            "No AI client is available (missing API keys)"
-        ));
-    }
+    // No cross-provider failover in phase 1; keep behavior deterministic.
+    let client = AiClientBuilder::new().build(&model_id).await?;
+    println!("✅ deepseek client initialized (model_id={})", model_id);
 
     let state = Arc::new(AppState {
         db,
-        clients,
-        rr_index: AtomicUsize::new(0),
+        provider_name,
+        client: Arc::new(client),
         start_time: Instant::now(),
         rate_limits: tokio::sync::RwLock::new(HashMap::new()),
         metrics: SimpleMetrics::new(),
@@ -144,7 +103,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/", get(index))
         .route("/test-md", get(test_md))
         .route("/js/marked.min.js", get(serve_marked_js))
-        .route("/rr-chat/stream", post(rr_chat_stream))
+        .route("/chat/stream", post(chat_stream))
         // Support both GET (query) and POST (JSON) for history for convenience
         .route("/history", get(get_history).post(get_history_post))
         .route("/health", get(health))
@@ -259,16 +218,11 @@ async fn serve_marked_js() -> Response<String> {
 
 async fn health(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     let uptime = state.start_time.elapsed().as_secs();
-    let providers: Vec<&str> = state
-        .clients
-        .iter()
-        .map(|(name, _)| name.as_str())
-        .collect();
     Json(json!({
         "status": "ok",
         "uptime_secs": uptime,
-        "active_providers": providers,
-        "provider_count": state.clients.len(),
+        "active_providers": [state.provider_name.as_str()],
+        "provider_count": 1,
     }))
 }
 
@@ -332,13 +286,13 @@ fn is_safe_message(message: &str) -> bool {
     message.len() <= 5000 && !message.to_lowercase().contains("hack")
 }
 
-// Round-robin streaming chat
-async fn rr_chat_stream(
+// Streaming chat (single provider: deepseek)
+async fn chat_stream(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<ChatRequest>,
 ) -> Response {
     use futures::StreamExt;
-    let timer = state.metrics.start_timer("rr_chat_stream").await;
+    let timer = state.metrics.start_timer("chat_stream").await;
 
     if is_rate_limited(&state, &payload.user_id).await {
         state
@@ -376,16 +330,12 @@ async fn rr_chat_stream(
     )
     .await;
 
-    // Select provider using round-robin
-    let idx = state.rr_index.fetch_add(1, Ordering::Relaxed) % state.clients.len();
-    let (provider_name, client) = &state.clients[idx];
-
     let state_clone = state.clone();
     let user_id = payload.user_id.clone();
     let session_id = payload.session_id.clone();
     let user_message = payload.message.clone();
-    let provider_name = provider_name.clone();
-    let client = client.clone();
+    let provider_name = state.provider_name.clone();
+    let client = state.client.clone();
 
     let metrics = state.metrics.clone();
     let stream = async_stream::stream! {
@@ -434,7 +384,14 @@ async fn rr_chat_stream(
                                         }
                                         StreamingEvent::StreamError { error, .. } => {
                                             metrics.incr_counter("ai_errors_total", 1).await;
-                                            let evt = json!({"type":"error","message": format!("Stream error: {}", error)});
+                                            let msg: String = error
+                                                .get("message")
+                                                .or_else(|| error.get("error"))
+                                                .and_then(|v| v.as_str())
+                                                .or_else(|| error.as_str())
+                                                .map(String::from)
+                                                .unwrap_or_else(|| error.to_string());
+                                            let evt = json!({"type":"error","message": format!("Stream error: {}", msg)});
                                             yield format!("data: {}\n\n", evt.to_string());
                                             break;
                                         }
@@ -461,7 +418,11 @@ async fn rr_chat_stream(
                 // Check for empty response and log warning
                 if full_response.is_empty() {
                     metrics.incr_counter("ai_errors_total", 1).await;
-                    let evt = json!({"type":"warning","message": "Received empty response from provider (stream ended with no content)"});
+                    let warning_msg = "Received empty response from provider. Potential causes: \
+                                       1) Provider returned an empty completion. \
+                                       2) Request was cancelled or handle was dropped prematurely. \
+                                       3) Protocol manifest rules failed to extract content from frames.";
+                    let evt = json!({"type":"warning","message": warning_msg});
                     yield format!("data: {}\n\n", evt.to_string());
                 }
 

@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Round-robin AI Chat (3 Providers)</title>
+<title>DeepSeek Streaming Chat</title>
 <style>
 @font-face {
     font-family: 'Intel One Mono';
@@ -337,7 +337,7 @@ body {
 </head>
 <body>
 <div id="header">
-    <h1>🚀 Round-robin AI Chat</h1>
+    <h1>DeepSeek Streaming Chat</h1>
 </div>
 
 <div id="chat-container"></div>
@@ -402,16 +402,16 @@ const copyLastAssistantBtn = document.getElementById('copy-last-assistant-btn');
 // 简化：不再需要模型选择和智能模式控件
 
 // User ID and session management
-let userId = localStorage.getItem('groqchat_user_id');
+let userId = localStorage.getItem('aitest_user_id');
 if (!userId) {
     userId = 'user-' + Math.random().toString(36).substring(2, 10);
-    localStorage.setItem('groqchat_user_id', userId);
+    localStorage.setItem('aitest_user_id', userId);
 }
 
-let sessionId = localStorage.getItem('groqchat_session_id');
+let sessionId = localStorage.getItem('aitest_session_id');
 if (!sessionId) {
     sessionId = 'session-' + Date.now() + '-' + Math.random().toString(36).substring(2, 8);
-    localStorage.setItem('groqchat_session_id', sessionId);
+    localStorage.setItem('aitest_session_id', sessionId);
 }
 
 let history = [];
@@ -553,7 +553,7 @@ async function fetchHistory() {
 // 开始新对话
 function startNewChat() {
     sessionId = 'session-' + Date.now() + '-' + Math.random().toString(36).substring(2, 8);
-    localStorage.setItem('groqchat_session_id', sessionId);
+    localStorage.setItem('aitest_session_id', sessionId);
     history = [];
     renderMessages();
     console.log('New chat:', sessionId);
@@ -574,14 +574,14 @@ async function sendMessage() {
     history.push({ role: 'user', content: message });
     renderMessages();
     input.value = '';
-    const assistantMsg = { role: 'assistant', content: '', provider: 'rr' };
+    const assistantMsg = { role: 'assistant', content: '', provider: 'deepseek' };
     history.push(assistantMsg);
     renderMessages();
     const assistantNodes = [...chatContainer.querySelectorAll('.message.assistant')];
     const currentAssistantEl = assistantNodes[assistantNodes.length-1];
     // Always update only the content area to preserve speaker header
     const contentDiv = currentAssistantEl.querySelector('.message-content') || currentAssistantEl;
-    const endpoint = '/rr-chat/stream';
+    const endpoint = '/chat/stream';
     const body = { user_id:userId, session_id:sessionId, message };
     currentAbortController = new AbortController();
     isStreaming = true; sendBtn.disabled = false; // allow stop
@@ -666,7 +666,7 @@ fetchHistory();
 
 // Welcome message
 setTimeout(() => {
-    addSystemMessage('Welcome to round-robin chat: fixed order Groq → Mistral → DeepSeek, with token count at the end.', 'system-info');
+    addSystemMessage('Welcome. This phase uses a single provider: DeepSeek. Responses stream in real time.', 'system-info');
 }, 500);
 </script>
 
