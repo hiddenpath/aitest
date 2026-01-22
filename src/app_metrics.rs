@@ -4,6 +4,7 @@ use std::time::Instant;
 
 // Define Metrics trait locally since ai-lib-rust doesn't have it
 #[async_trait]
+#[allow(dead_code)] // 部分方法为扩展预留，当前示例未全部使用
 pub trait Metrics: Send + Sync {
     async fn incr_counter(&self, name: &str, value: u64);
     async fn record_gauge(&self, name: &str, value: f64);
