@@ -24,7 +24,7 @@ The `type` determines required/optional fields below.
 
 1) provider
 ```json
-{ "type": "provider", "provider": "groq|mistral|deepseek|..." }
+{ "type": "provider", "provider": "groq|mistral|deepseek|...", "model_id": "provider/model" }
 ```
 
 2) delta (streamed content)

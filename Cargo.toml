@@ -12,7 +12,7 @@ axum = { version = "0.8.7", features = ["macros"] }
 tokio = { version = "1.48.0", features = ["full"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
-ai-lib-rust = "0.5.1"
+ai-lib-rust = "0.6.0"
 sqlx = { version = "0.8.6", features = ["runtime-tokio-rustls", "sqlite"] }
 anyhow = "1.0.100"
 futures = "0.3"

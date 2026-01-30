@@ -1,8 +1,10 @@
-# ai-lib-rust Axum Example: DeepSeek Streaming Chat (Phase 1)
+# ai-lib-rust Axum Example: Streaming Chat (Phase 2 - Model Switch)
 
-This is a minimal, production-lean example showing how to integrate `ai-lib-rust` with an Axum web server and a simple, single-file frontend. Phase 1 demonstrates:
+中文说明见 [README_CN.md](./README_CN.md).
 
-- A unified client interface to a single provider (DeepSeek)
+This is a minimal, production-lean example showing how to integrate `ai-lib-rust` with an Axum web server and a simple, single-file frontend. Phase 2 demonstrates:
+
+- A unified client interface across providers/models (e.g., DeepSeek + Groq)
 - Server-Sent Events (SSE) streaming
 - SQLite-backed chat history
 - Basic rate limiting and safety checks
@@ -12,28 +14,27 @@ It is intentionally simple, focusing on clarity and correctness rather than “s
 
 ## What this example is (and isn’t)
 
-- Is: a small Axum app that streams chat completions from a **single provider (DeepSeek)** with a clean `ai-lib-rust` integration.
+- Is: a small Axum app that streams chat completions from a **selected model** with a clean `ai-lib-rust` integration.
 - Is not: a full “smart router,” multi-provider merge, or cost optimizer. Those are easy to build on top, but omitted here to keep the example focused and auditable.
 
-## 构建说明（中文 / Mingw）
-
-使用**本地 mingw 工具链**编译时，请执行：
-
-```powershell
-rustup run stable-x86_64-pc-windows-gnu cargo build
-```
-
-若已 `rustup default stable-x86_64-pc-windows-gnu`，可直接 `cargo build`。  
-环境变量、运行方式及与 ai-lib-rust 的对接说明见 **[构建说明.md](./构建说明.md)**。
+For detailed Chinese build instructions (e.g. mingw), see [构建说明.md](./构建说明.md).
 
 ## Prerequisites
 
 - Rust 1.70+
 - SQLite
 
+## Build
+
+```bash
+cargo build
+```
+
+On Windows with mingw toolchain only: `rustup run stable-x86_64-pc-windows-gnu cargo build`. For detailed build and environment setup, see [构建说明.md](./构建说明.md).
+
 ## Configure environment
 
-Set the DeepSeek API key.
+Set the API keys for the providers you plan to use.
 
 ```bash
 # Windows PowerShell (example)
@@ -48,8 +49,10 @@ $env:DATABASE_URL = "sqlite:///path/to/chat.db"
 
 Notes:
 - The example prefers `PROXY_URL`, and will also fall back to `AI_PROXY_URL` if set.
-- If DeepSeek auth is not configured (env or keyring), requests will fail.
-- Optional: override model id via `DEEPSEEK_MODEL_ID` or `MODEL_ID` (default: `deepseek/deepseek-chat`).
+- If auth is not configured (env or keyring) for the selected provider, requests will fail.
+- Default model id: `MODEL_ID` (or legacy `DEEPSEEK_MODEL_ID`) (default: `deepseek/deepseek-chat`).
+- Optional allowlist (comma-separated): `ALLOWED_MODEL_IDS` (or `MODEL_IDS`)
+- Optional context cap: `MAX_CONTEXT_MESSAGES` (default: 6) — max history messages sent per request; lower values avoid TPM/413 errors on providers like Groq free tier (6000 TPM)
 
 ## Run
 
@@ -63,6 +66,7 @@ Visit `http://127.0.0.1:3000`.
 
 - `GET /` – static single-page chat UI (English)
 - `GET /health` – service health, uptime, and active providers
+- `GET /models` – allowed model list and default model id (used by the UI)
 - `GET /history?user_id=...&session_id=...` – latest 50 messages for a session
 - `POST /history` – same as GET but accepts JSON `{ user_id, session_id }`
 - `POST /chat/stream` – SSE streaming chat (JSON events); request body:
@@ -71,14 +75,15 @@ Visit `http://127.0.0.1:3000`.
 {
   "user_id": "user-abc",
   "session_id": "session-xyz",
-  "message": "Hello"
+  "message": "Hello",
+  "model_id": "groq/llama-3.1-8b-instant"
 }
 ```
 
 SSE event payloads (each event is a single JSON object sent via `data: { ... }`):
 
 ```json
-{ "type": "provider", "provider": "deepseek" }
+{ "type": "provider", "provider": "deepseek", "model_id": "deepseek/deepseek-chat" }
 { "type": "delta", "content": "partial text" }
 { "type": "usage", "tokens": 123, "accurate": false }
 { "type": "error", "message": "..." }
@@ -90,9 +95,9 @@ See `SSE_EVENTS_SCHEMA.md` for the full schema and error-class guidance, and `TO
 
 ## How this uses ai-lib-rust
 
-- DeepSeek is instantiated via `AiClientBuilder` (or `AiClient::new()`).
+- A client is instantiated via `AiClientBuilder` (or `AiClient::new()`), keyed by `model_id`.
 - All requests use the unified runtime chat builder API (`client.chat()...stream().execute_stream()`).
-- Phase 1 intentionally avoids cross-provider routing/failover to keep behavior deterministic.
+- Model switching is done by passing `model_id` from the frontend (or defaulting to `MODEL_ID`).
 - Metrics are recorded through a local `Metrics` implementation (`src/app_metrics.rs`), which you can swap with a real backend.
 
 ## Frontend
@@ -112,7 +117,6 @@ Streaming responses rarely include provider usage in-band. We therefore report a
 - `src/main.rs` – Axum server, routes, SSE streaming
 - `src/app_metrics.rs` – `ai-lib` metrics trait demo (`SimpleMetrics`)
 - `static/` – single-page UI and local assets (marked, prism)
-- `tests/` – minimal skeleton to extend later
 
 ## Suggested extensions (left out to keep this example small)
 

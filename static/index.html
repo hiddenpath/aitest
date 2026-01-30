@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>DeepSeek Streaming Chat</title>
+<title>AI Streaming Chat</title>
 <style>
 @font-face {
     font-family: 'Intel One Mono';
@@ -118,6 +118,24 @@ body {
     gap: 12px;
     align-items: flex-end;
     flex-wrap: wrap;
+}
+
+#model-controls {
+    display: inline-flex;
+    gap: 8px;
+    align-items: center;
+    flex-wrap: wrap;
+}
+
+#model-select {
+    padding: 10px 12px;
+    border: 1px solid #d1d9e0;
+    border-radius: 12px;
+    background: #fff;
+    font-size: 14px;
+    min-height: 48px;
+    min-width: 220px;
+    color: #2d3748;
 }
 
 #message-input {
@@ -337,7 +355,7 @@ body {
 </head>
 <body>
 <div id="header">
-    <h1>DeepSeek Streaming Chat</h1>
+    <h1 id="header-title">AI Streaming Chat</h1>
 </div>
 
 <div id="chat-container"></div>
@@ -345,7 +363,11 @@ body {
 <div id="input-area">
     <button id="new-chat-btn" class="btn">✨ New Chat</button>
     
-    <!-- 简化：不再展示智能调度/模型选择/成本设置 -->
+    <div id="model-controls">
+        <select id="model-select" aria-label="Model"></select>
+        <button id="model-deepseek-btn" class="btn btn-outline" type="button" title="Switch to DeepSeek">DeepSeek</button>
+        <button id="model-groq-btn" class="btn btn-outline" type="button" title="Switch to Groq">Groq</button>
+    </div>
     
     <textarea id="message-input" placeholder="Type a message... Shift+Enter for newline, Enter to send" rows="1"></textarea>
     <button id="send-btn" class="btn">📤 Send</button>
@@ -399,7 +421,58 @@ const sendBtn = document.getElementById('send-btn');
 const newChatBtn = document.getElementById('new-chat-btn');
 const copyLastUserBtn = document.getElementById('copy-last-user-btn');
 const copyLastAssistantBtn = document.getElementById('copy-last-assistant-btn');
-// 简化：不再需要模型选择和智能模式控件
+const modelSelect = document.getElementById('model-select');
+const modelDeepSeekBtn = document.getElementById('model-deepseek-btn');
+const modelGroqBtn = document.getElementById('model-groq-btn');
+const headerTitle = document.getElementById('header-title');
+
+let availableModels = [];
+let currentModelId = null;
+
+function getModelInfo(modelId){
+    return availableModels.find(m => m && m.id === modelId) || null;
+}
+
+function setHeaderForModel(modelId){
+    const info = getModelInfo(modelId);
+    const label = info?.display_name || modelId || 'unknown';
+    if (headerTitle) headerTitle.textContent = `AI Streaming Chat • ${label}`;
+}
+
+function setCurrentModel(modelId, { announce = true } = {}){
+    if (!modelId) return;
+    currentModelId = modelId;
+    localStorage.setItem('aitest_model_id', modelId);
+    if (modelSelect) modelSelect.value = modelId;
+    setHeaderForModel(modelId);
+    if (announce) addSystemMessage(`✅ Switched model to: ${getModelInfo(modelId)?.display_name || modelId}`, 'system-info');
+}
+
+async function fetchModels(){
+    try {
+        const res = await fetch('/models');
+        const data = await res.json();
+        availableModels = Array.isArray(data.models) ? data.models : [];
+        // Populate select
+        if (modelSelect) {
+            modelSelect.innerHTML = '';
+            for (const m of availableModels) {
+                const opt = document.createElement('option');
+                opt.value = m.id;
+                opt.textContent = m.display_name || m.id;
+                modelSelect.appendChild(opt);
+            }
+        }
+
+        const saved = localStorage.getItem('aitest_model_id');
+        const defaultId = data.default_model_id || (availableModels[0] && availableModels[0].id);
+        const initial = (saved && getModelInfo(saved)) ? saved : defaultId;
+        setCurrentModel(initial, { announce: false });
+    } catch (err) {
+        console.warn('Failed to fetch models', err);
+        // Fallback: keep header as-is; user can still send without model_id.
+    }
+}
 
 // User ID and session management
 let userId = localStorage.getItem('aitest_user_id');
@@ -570,11 +643,12 @@ async function sendMessage() {
     if (isStreaming) return;
     const message = input.value; // do not trim; show exactly what user typed
     if (!message) return;
-    // 简化：无需模型选择
+    const selectedModelId = currentModelId || localStorage.getItem('aitest_model_id') || null;
     history.push({ role: 'user', content: message });
     renderMessages();
     input.value = '';
-    const assistantMsg = { role: 'assistant', content: '', provider: 'deepseek' };
+    const initialProvider = (selectedModelId || 'unknown').split('/')[0];
+    const assistantMsg = { role: 'assistant', content: '', provider: initialProvider, model_id: selectedModelId };
     history.push(assistantMsg);
     renderMessages();
     const assistantNodes = [...chatContainer.querySelectorAll('.message.assistant')];
@@ -582,7 +656,7 @@ async function sendMessage() {
     // Always update only the content area to preserve speaker header
     const contentDiv = currentAssistantEl.querySelector('.message-content') || currentAssistantEl;
     const endpoint = '/chat/stream';
-    const body = { user_id:userId, session_id:sessionId, message };
+    const body = { user_id:userId, session_id:sessionId, message, model_id: selectedModelId };
     currentAbortController = new AbortController();
     isStreaming = true; sendBtn.disabled = false; // allow stop
     sendBtn.textContent='🟥 Stop';
@@ -608,6 +682,10 @@ async function sendMessage() {
                     assistantMsg.provider = prov;
                     const speaker = currentAssistantEl.querySelector('.speaker-info');
                     if (speaker) speaker.textContent = `🤖 ${prov}`;
+                    if (evt.model_id) {
+                        assistantMsg.model_id = evt.model_id;
+                        setHeaderForModel(evt.model_id);
+                    }
                     continue;
                 }
                 if (evt.type === 'delta' && typeof evt.content === 'string') {
@@ -643,6 +721,18 @@ function cancelStreaming(){ if(currentAbortController){ currentAbortController.a
 // 事件绑定
 sendBtn.addEventListener('click', () => { if (isStreaming) { cancelStreaming(); } else { sendMessage(); }});
 newChatBtn.addEventListener('click', startNewChat);
+if (modelSelect) {
+    modelSelect.addEventListener('change', () => {
+        const id = modelSelect.value;
+        if (id) setCurrentModel(id);
+    });
+}
+if (modelDeepSeekBtn) {
+    modelDeepSeekBtn.addEventListener('click', () => setCurrentModel('deepseek/deepseek-chat'));
+}
+if (modelGroqBtn) {
+    modelGroqBtn.addEventListener('click', () => setCurrentModel('groq/llama-3.1-8b-instant'));
+}
 copyLastUserBtn.addEventListener('click', () => copyLastByRole('user'));
 copyLastAssistantBtn.addEventListener('click', () => copyLastByRole('assistant'));
 
@@ -662,11 +752,12 @@ input.addEventListener('input', () => {
 
 
 // 初始化
+fetchModels();
 fetchHistory();
 
 // Welcome message
 setTimeout(() => {
-    addSystemMessage('Welcome. This phase uses a single provider: DeepSeek. Responses stream in real time.', 'system-info');
+    addSystemMessage('Welcome. Pick a model (e.g., DeepSeek / Groq) and start chatting. Responses stream in real time.', 'system-info');
 }, 500);
 </script>
 

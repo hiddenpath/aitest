@@ -19,13 +19,14 @@ mod app_metrics;
 use crate::app_metrics::{Metrics, SimpleMetrics};
 
 // App state
-pub struct AppState {
-    pub db: SqlitePool,
-    pub provider_name: String,
-    pub client: Arc<AiClient>,
-    pub start_time: Instant,
-    pub rate_limits: tokio::sync::RwLock<HashMap<String, Vec<Instant>>>,
-    pub metrics: Arc<SimpleMetrics>,
+struct AppState {
+    db: SqlitePool,
+    default_model_id: String,
+    allowed_models: Vec<ModelInfo>,
+    clients: tokio::sync::RwLock<HashMap<String, Arc<AiClient>>>,
+    start_time: Instant,
+    rate_limits: tokio::sync::RwLock<HashMap<String, Vec<Instant>>>,
+    metrics: Arc<SimpleMetrics>,
 }
 
 // Request/response types
@@ -34,6 +35,8 @@ struct ChatRequest {
     user_id: String,
     session_id: String,
     message: String,
+    /// Optional override; when absent, server uses `default_model_id`.
+    model_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -42,10 +45,23 @@ struct HistoryQuery {
     session_id: String,
 }
 
+#[derive(Deserialize)]
+struct HistoryRequest {
+    user_id: String,
+    session_id: String,
+}
+
 #[derive(Serialize, sqlx::FromRow)]
 struct HistoryMessage {
     role: String,
     content: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ModelInfo {
+    id: String,
+    provider: String,
+    display_name: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -67,42 +83,64 @@ async fn main() -> anyhow::Result<()> {
     let db = SqlitePool::connect(&db_url).await?;
     sqlx::query("CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT, session_id TEXT, role TEXT, content TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)").execute(&db).await?;
 
-    // Initialize a SINGLE provider: DeepSeek only.
-    // Canonical model id is provider/model. Auth is resolved automatically via:
+    // Phase 2: allow switching provider/model from the frontend.
+    //
+    // Canonical model id format is `provider/model`. Auth is resolved automatically via:
     // 1) OS keyring entry ("ai-protocol", provider_id)
-    // 2) env var: <PROVIDER_ID>_API_KEY (e.g., DEEPSEEK_API_KEY)
-    let provider_name = "deepseek".to_string();
-    let model_id = std::env::var("DEEPSEEK_MODEL_ID")
-        .or_else(|_| std::env::var("MODEL_ID"))
+    // 2) env var: <PROVIDER_ID>_API_KEY (e.g., DEEPSEEK_API_KEY, GROQ_API_KEY)
+    let default_model_id = std::env::var("MODEL_ID")
+        .or_else(|_| std::env::var("DEEPSEEK_MODEL_ID"))
         .unwrap_or_else(|_| "deepseek/deepseek-chat".to_string());
 
-    let provider_env = provider_api_key_env(&model_id);
-    if std::env::var(&provider_env).is_ok() {
-        println!("🔑 {} found for {}", provider_env, provider_name);
-    } else {
-        println!(
-            "ℹ️ {} not set for deepseek (OK if keyring is configured), continuing",
-            provider_env
-        );
+    let mut allowed_models = allowed_models_from_env()
+        .unwrap_or_else(|| vec![
+            model_info_from_id("deepseek/deepseek-chat"),
+            // Groq current models (llama3-8b-8192 / llama3-70b-8192 are decommissioned)
+            model_info_from_id("groq/llama-3.1-8b-instant"),
+            model_info_from_id("groq/llama-3.3-70b-versatile"),
+        ]);
+    // Ensure the default model is selectable (even if the allowlist is provided).
+    if !allowed_models.iter().any(|m| m.id == default_model_id) {
+        allowed_models.insert(0, model_info_from_id(&default_model_id));
     }
 
-    // No cross-provider failover in phase 1; keep behavior deterministic.
-    let client = AiClientBuilder::new().build(&model_id).await?;
-    println!("✅ deepseek client initialized (model_id={})", model_id);
+    // Print auth hints for all allowed providers (best-effort).
+    for m in &allowed_models {
+        let env = provider_api_key_env(&m.id);
+        if std::env::var(&env).is_ok() {
+            println!("🔑 {} found for {}", env, m.provider);
+        } else {
+            println!(
+                "ℹ️ {} not set for {} (OK if keyring is configured), continuing",
+                env, m.provider
+            );
+        }
+    }
 
     let state = Arc::new(AppState {
         db,
-        provider_name,
-        client: Arc::new(client),
+        default_model_id: default_model_id.clone(),
+        allowed_models,
+        clients: tokio::sync::RwLock::new(HashMap::new()),
         start_time: Instant::now(),
         rate_limits: tokio::sync::RwLock::new(HashMap::new()),
         metrics: SimpleMetrics::new(),
     });
 
+    // Warm up the default model client at startup so we fail fast if misconfigured.
+    let default_client = AiClientBuilder::new().build(&default_model_id).await?;
+    state
+        .clients
+        .write()
+        .await
+        .insert(default_model_id.clone(), Arc::new(default_client));
+    println!("✅ default client initialized (model_id={})", default_model_id);
+
     let app = Router::new()
         .route("/", get(index))
         .route("/test-md", get(test_md))
         .route("/js/marked.min.js", get(serve_marked_js))
+        .route("/models", get(get_models))
         .route("/chat/stream", post(chat_stream))
         // Support both GET (query) and POST (JSON) for history for convenience
         .route("/history", get(get_history).post(get_history_post))
@@ -218,11 +256,27 @@ async fn serve_marked_js() -> Response<String> {
 
 async fn health(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     let uptime = state.start_time.elapsed().as_secs();
+    let mut providers: Vec<String> = state
+        .allowed_models
+        .iter()
+        .map(|m| m.provider.clone())
+        .collect();
+    providers.sort();
+    providers.dedup();
+    let provider_count = providers.len();
     Json(json!({
         "status": "ok",
         "uptime_secs": uptime,
-        "active_providers": [state.provider_name.as_str()],
-        "provider_count": 1,
+        "default_model_id": state.default_model_id.as_str(),
+        "active_providers": providers,
+        "provider_count": provider_count,
+    }))
+}
+
+async fn get_models(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    Json(json!({
+        "default_model_id": state.default_model_id.as_str(),
+        "models": &state.allowed_models
     }))
 }
 
@@ -248,7 +302,7 @@ async fn get_history(
 // POST /history with JSON body
 async fn get_history_post(
     State(state): State<Arc<AppState>>,
-    Json(payload): Json<ChatRequest>,
+    Json(payload): Json<HistoryRequest>,
 ) -> Json<serde_json::Value> {
     let mut rows = sqlx::query_as::<_, HistoryMessage>(
         "SELECT role, content FROM messages WHERE user_id = ?1 AND session_id = ?2 ORDER BY id DESC LIMIT 50"
@@ -334,13 +388,43 @@ async fn chat_stream(
     let user_id = payload.user_id.clone();
     let session_id = payload.session_id.clone();
     let user_message = payload.message.clone();
-    let provider_name = state.provider_name.clone();
-    let client = state.client.clone();
+    let model_id = payload
+        .model_id
+        .clone()
+        .unwrap_or_else(|| state.default_model_id.clone());
+
+    if !is_allowed_model_id(&state, &model_id) {
+        state.metrics.incr_counter("ai_errors_total", 1).await;
+        let evt = json!({"type":"error","message": format!("Model not allowed: {}", model_id)}).to_string();
+        let resp = Response::builder()
+            .status(200)
+            .header("Content-Type", "text/event-stream")
+            .body(Body::from(format!("data: {}\n\n", evt)))
+            .unwrap();
+        if let Some(t) = timer {
+            t.stop();
+        }
+        return resp;
+    }
+
+    let provider_name = model_id.split('/').next().unwrap_or("unknown").to_string();
 
     let metrics = state.metrics.clone();
     let stream = async_stream::stream! {
-        let prov_evt = json!({"type":"provider","provider": provider_name});
+        let prov_evt = json!({"type":"provider","provider": provider_name, "model_id": model_id});
         yield format!("data: {}\n\n", prov_evt.to_string());
+
+        // Resolve (or lazily create) a client for the requested model id.
+        let client = match get_or_create_client(&state_clone, &model_id).await {
+            Ok(c) => c,
+            Err(e) => {
+                metrics.incr_counter("ai_errors_total", 1).await;
+                let evt = json!({"type":"error","message": format!("Client init failed: {}", e)});
+                yield format!("data: {}\n\n", evt.to_string());
+                yield "data: {\"type\":\"done\"}\n\n".to_string();
+                return;
+            }
+        };
 
         // Runtime chat: builder-based request (no Provider enum, no SDK request structs).
         // Keep a copy for token estimation after the stream completes.
@@ -482,17 +566,28 @@ async fn chat_stream(
 }
 
 // Helpers
+/// Max number of history messages to include in context (reduces request size for providers with low TPM, e.g. Groq free tier 6000).
+fn max_context_messages() -> i32 {
+    std::env::var("MAX_CONTEXT_MESSAGES")
+        .ok()
+        .and_then(|s| s.parse::<i32>().ok())
+        .map(|n| n.clamp(2, 50))
+        .unwrap_or(6)
+}
+
 async fn build_message_sequence(
     db: &SqlitePool,
     user_id: &str,
     session_id: &str,
     new_message: &str,
 ) -> Vec<Message> {
+    let limit = max_context_messages();
     let history = sqlx::query_as::<_, HistoryMessage>(
-        "SELECT role, content FROM messages WHERE user_id = ?1 AND session_id = ?2 ORDER BY id DESC LIMIT 10"
+        "SELECT role, content FROM messages WHERE user_id = ?1 AND session_id = ?2 ORDER BY id DESC LIMIT ?3",
     )
     .bind(user_id)
     .bind(session_id)
+    .bind(limit)
     .fetch_all(db)
     .await
     .unwrap_or_default();
@@ -677,6 +772,75 @@ fn estimate_text_tokens(s: &str) -> usize {
 fn provider_api_key_env(model_id: &str) -> String {
     let provider = model_id.split('/').next().unwrap_or(model_id);
     format!("{}_API_KEY", provider.to_uppercase())
+}
+
+fn is_allowed_model_id(state: &AppState, model_id: &str) -> bool {
+    state.allowed_models.iter().any(|m| m.id == model_id)
+}
+
+fn allowed_models_from_env() -> Option<Vec<ModelInfo>> {
+    // Comma-separated list of `provider/model` ids, e.g.:
+    // ALLOWED_MODEL_IDS="deepseek/deepseek-chat,groq/llama-3.1-8b-instant"
+    let raw = std::env::var("ALLOWED_MODEL_IDS")
+        .or_else(|_| std::env::var("MODEL_IDS"))
+        .ok()?;
+
+    let mut out = Vec::new();
+    for part in raw.split(',') {
+        let id = part.trim();
+        if id.is_empty() {
+            continue;
+        }
+        out.push(model_info_from_id(id));
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+fn model_info_from_id(model_id: &str) -> ModelInfo {
+    let provider = model_id
+        .split('/')
+        .next()
+        .unwrap_or(model_id)
+        .to_string();
+
+    let display_name = match model_id {
+        "deepseek/deepseek-chat" => "DeepSeek Chat".to_string(),
+        "groq/llama-3.1-8b-instant" => "Groq • Llama 3.1 8B Instant".to_string(),
+        "groq/llama-3.3-70b-versatile" => "Groq • Llama 3.3 70B Versatile".to_string(),
+        "groq/llama3-8b-8192" => "Groq • Llama 3 8B (deprecated)".to_string(),
+        "groq/llama3-70b-8192" => "Groq • Llama 3 70B (deprecated)".to_string(),
+        _ => model_id.to_string(),
+    };
+
+    ModelInfo {
+        id: model_id.to_string(),
+        provider,
+        display_name,
+    }
+}
+
+async fn get_or_create_client(
+    state: &Arc<AppState>,
+    model_id: &str,
+) -> anyhow::Result<Arc<AiClient>> {
+    {
+        let guard = state.clients.read().await;
+        if let Some(c) = guard.get(model_id) {
+            return Ok(c.clone());
+        }
+    }
+
+    // Build without holding any locks.
+    let built = AiClientBuilder::new().build(model_id).await?;
+    let built = Arc::new(built);
+
+    let mut guard = state.clients.write().await;
+    let entry = guard.entry(model_id.to_string()).or_insert_with(|| built.clone());
+    Ok(entry.clone())
 }
 
 // Simple validation function for fixed code examples
