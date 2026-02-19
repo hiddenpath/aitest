@@ -139,6 +139,7 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .route("/", get(index))
         .route("/test-md", get(test_md))
+        .route("/favicon.svg", get(serve_favicon))
         .route("/js/marked.min.js", get(serve_marked_js))
         .route("/models", get(get_models))
         .route("/chat/stream", post(chat_stream))
@@ -242,6 +243,14 @@ async fn test_md() -> Html<&'static str> {
 </body>
 </html>"#;
     Html(PAGE)
+}
+
+async fn serve_favicon() -> Response<String> {
+    Response::builder()
+        .header("Content-Type", "image/svg+xml")
+        .header("Cache-Control", "public, max-age=86400")
+        .body(include_str!("../static/favicon.svg").to_string())
+        .unwrap()
 }
 
 async fn serve_marked_js() -> Response<String> {
