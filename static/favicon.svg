@@ -1,4 +1,5 @@
 <svg viewBox="0 0 200 200" xmlns="http://www.w3.org/2000/svg">
+    <style>svg{color:#000}@media(prefers-color-scheme:dark){svg{color:#fff}}</style>
     <path fill="#1f5fbf" d="M100 66l-16 9-1 25-8 7-2 30 27 20 27-20-2-30-8-7-1-25z" />
     <g stroke="currentColor" stroke-width="5" stroke-linecap="round" stroke-linejoin="round" fill="none">
         <path d="M90 95 60 66 75 22" />
