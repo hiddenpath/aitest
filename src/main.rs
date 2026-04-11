@@ -1,4 +1,6 @@
-use ai_lib_rust::{AiClient, AiClientBuilder, Message, StreamingEvent};
+use ai_lib_rust::{
+    client::UnifiedResponse, AiClient, AiClientBuilder, Error as AiError, Message, StreamingEvent,
+};
 use axum::body::Body;
 use axum::http::{HeaderValue, Method};
 use axum::{
@@ -64,6 +66,25 @@ struct ModelInfo {
     display_name: String,
 }
 
+/// JSON body for `POST /chat` (non-streaming). Stable shape for demos and external tooling.
+#[derive(Default, Serialize)]
+struct ChatJsonResponse {
+    ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content: Option<String>,
+    /// Same fields as SSE `usage` events (`prompt_tokens`, `accurate_total`, …).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    usage: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    warning: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct TokenUsageSummary {
     // Provider-supplied (if available)
@@ -92,13 +113,7 @@ async fn main() -> anyhow::Result<()> {
         .or_else(|_| std::env::var("DEEPSEEK_MODEL_ID"))
         .unwrap_or_else(|_| "deepseek/deepseek-chat".to_string());
 
-    let mut allowed_models = allowed_models_from_env()
-        .unwrap_or_else(|| vec![
-            model_info_from_id("deepseek/deepseek-chat"),
-            // Groq current models (llama3-8b-8192 / llama3-70b-8192 are decommissioned)
-            model_info_from_id("groq/llama-3.1-8b-instant"),
-            model_info_from_id("groq/llama-3.3-70b-versatile"),
-        ]);
+    let mut allowed_models = allowed_models_from_env().unwrap_or_else(default_allowed_models);
     // Ensure the default model is selectable (even if the allowlist is provided).
     if !allowed_models.iter().any(|m| m.id == default_model_id) {
         allowed_models.insert(0, model_info_from_id(&default_model_id));
@@ -134,7 +149,10 @@ async fn main() -> anyhow::Result<()> {
         .write()
         .await
         .insert(default_model_id.clone(), Arc::new(default_client));
-    println!("✅ default client initialized (model_id={})", default_model_id);
+    println!(
+        "✅ default client initialized (model_id={})",
+        default_model_id
+    );
 
     let app = Router::new()
         .route("/", get(index))
@@ -142,6 +160,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/favicon.svg", get(serve_favicon))
         .route("/js/marked.min.js", get(serve_marked_js))
         .route("/models", get(get_models))
+        // Primary path: one-shot chat (non-streaming). Easier to validate providers end-to-end.
+        .route("/chat", post(chat_complete))
         .route("/chat/stream", post(chat_stream))
         // Support both GET (query) and POST (JSON) for history for convenience
         .route("/history", get(get_history).post(get_history_post))
@@ -164,7 +184,7 @@ async fn main() -> anyhow::Result<()> {
     let local_ip = std::env::var("LOCAL_IP").unwrap_or_else(|_| {
         // Try to get local IP on Windows
         if let Ok(output) = std::process::Command::new("ipconfig")
-            .args(&["/all"])
+            .args(["/all"])
             .output()
         {
             let output_str = String::from_utf8_lossy(&output.stdout);
@@ -349,42 +369,40 @@ fn is_safe_message(message: &str) -> bool {
     message.len() <= 5000 && !message.to_lowercase().contains("hack")
 }
 
-// Streaming chat (single provider: deepseek)
-async fn chat_stream(
-    State(state): State<Arc<AppState>>,
-    Json(payload): Json<ChatRequest>,
-) -> Response {
-    use futures::StreamExt;
-    let timer = state.metrics.start_timer("chat_stream").await;
+/// Shared inputs for a chat turn after validation (rate limit, model allowlist, history).
+struct PreparedChat {
+    messages: Vec<Message>,
+    messages_for_usage: Vec<Message>,
+    model_id: String,
+    user_id: String,
+    session_id: String,
+    user_message: String,
+    provider_name: String,
+}
 
-    if is_rate_limited(&state, &payload.user_id).await {
-        state
-            .metrics
-            .incr_counter("ai_requests_rate_limited", 1)
-            .await;
-        return Response::builder()
-            .status(200)
-            .header("Content-Type", "text/event-stream")
-            .body(Body::from("data: {\"type\":\"rate_limited\"}\n\n"))
-            .unwrap();
+enum PrepareChatFail {
+    RateLimited,
+    Unsafe,
+    ModelNotAllowed(String),
+}
+
+async fn prepare_chat_turn(
+    state: &Arc<AppState>,
+    payload: &ChatRequest,
+) -> Result<PreparedChat, PrepareChatFail> {
+    if is_rate_limited(state, &payload.user_id).await {
+        return Err(PrepareChatFail::RateLimited);
     }
-
-    // safety check
     if !is_safe_message(&payload.message) {
-        state.metrics.incr_counter("ai_errors_total", 1).await;
-        let evt = json!({"type":"error","message":"Request content rejected"}).to_string();
-        let resp = Response::builder()
-            .status(200)
-            .header("Content-Type", "text/event-stream")
-            .body(Body::from(format!("data: {}\n\n", evt)))
-            .unwrap();
-        if let Some(t) = timer {
-            t.stop();
-        }
-        return resp;
+        return Err(PrepareChatFail::Unsafe);
     }
-
-    // Build message history
+    let model_id = payload
+        .model_id
+        .clone()
+        .unwrap_or_else(|| state.default_model_id.clone());
+    if !is_allowed_model_id(state, &model_id) {
+        return Err(PrepareChatFail::ModelNotAllowed(model_id));
+    }
     let messages = build_message_sequence(
         &state.db,
         &payload.user_id,
@@ -392,31 +410,262 @@ async fn chat_stream(
         &payload.message,
     )
     .await;
+    let messages_for_usage = messages.clone();
+    let provider_name = model_id.split('/').next().unwrap_or("unknown").to_string();
+    Ok(PreparedChat {
+        messages,
+        messages_for_usage,
+        model_id,
+        user_id: payload.user_id.clone(),
+        session_id: payload.session_id.clone(),
+        user_message: payload.message.clone(),
+        provider_name,
+    })
+}
+
+fn usage_summary_to_json(u: &TokenUsageSummary) -> serde_json::Value {
+    json!({
+        "type": "usage",
+        "tokens": u.total_tokens,
+        "accurate": u.accurate_total,
+        "prompt_tokens": u.prompt_tokens,
+        "completion_tokens": u.completion_tokens,
+        "total_tokens": u.total_tokens,
+        "accurate_total": u.accurate_total,
+        "accurate_breakdown": u.accurate_breakdown,
+    })
+}
+
+fn is_provider_overloaded(e: &AiError) -> bool {
+    matches!(
+        e,
+        AiError::Remote {
+            status: 429 | 502 | 503,
+            ..
+        }
+    )
+}
+
+/// Non-streaming chat: `client.chat().execute()` → one JSON response. Default integration path for aitest.
+async fn chat_complete(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<ChatRequest>,
+) -> Json<ChatJsonResponse> {
+    let timer = state.metrics.start_timer("chat_complete").await;
+
+    let prep = match prepare_chat_turn(&state, &payload).await {
+        Ok(p) => p,
+        Err(PrepareChatFail::RateLimited) => {
+            state
+                .metrics
+                .incr_counter("ai_requests_rate_limited", 1)
+                .await;
+            if let Some(t) = timer {
+                t.stop();
+            }
+            return Json(ChatJsonResponse {
+                ok: false,
+                message: Some("Too many requests. Please try again later.".into()),
+                ..Default::default()
+            });
+        }
+        Err(PrepareChatFail::Unsafe) => {
+            state.metrics.incr_counter("ai_errors_total", 1).await;
+            if let Some(t) = timer {
+                t.stop();
+            }
+            return Json(ChatJsonResponse {
+                ok: false,
+                message: Some("Request content rejected".into()),
+                ..Default::default()
+            });
+        }
+        Err(PrepareChatFail::ModelNotAllowed(id)) => {
+            state.metrics.incr_counter("ai_errors_total", 1).await;
+            if let Some(t) = timer {
+                t.stop();
+            }
+            return Json(ChatJsonResponse {
+                ok: false,
+                message: Some(format!("Model not allowed: {}", id)),
+                ..Default::default()
+            });
+        }
+    };
+
+    let client = match get_or_create_client(&state, &prep.model_id).await {
+        Ok(c) => c,
+        Err(e) => {
+            state.metrics.incr_counter("ai_errors_total", 1).await;
+            if let Some(t) = timer {
+                t.stop();
+            }
+            return Json(ChatJsonResponse {
+                ok: false,
+                message: Some(format!("Client init failed: {}", e)),
+                ..Default::default()
+            });
+        }
+    };
+
+    let exec = tokio::time::timeout(
+        Duration::from_secs(120),
+        client
+            .chat()
+            .messages(prep.messages)
+            .temperature(0.7)
+            .max_tokens(4096)
+            .execute(),
+    )
+    .await;
+
+    match exec {
+        Ok(Ok(UnifiedResponse {
+            content: full_response,
+            usage,
+            ..
+        })) => {
+            let mut warning = None;
+            if full_response.is_empty() {
+                state.metrics.incr_counter("ai_errors_total", 1).await;
+                warning = Some(
+                    "Empty assistant text from provider. Check keys, proxy, or protocol mapping."
+                        .to_string(),
+                );
+            } else {
+                let _ = save_chat_history(
+                    &state.db,
+                    &prep.user_id,
+                    &prep.session_id,
+                    &prep.user_message,
+                    &full_response,
+                )
+                .await;
+            }
+
+            let usage_summary = estimate_tokens(usage, &prep.messages_for_usage, &full_response);
+            if usage_summary.accurate_total {
+                state
+                    .metrics
+                    .incr_counter("ai_tokens_used_accurate", usage_summary.total_tokens as u64)
+                    .await;
+            } else {
+                state
+                    .metrics
+                    .incr_counter(
+                        "ai_tokens_used_estimated",
+                        usage_summary.total_tokens as u64,
+                    )
+                    .await;
+            }
+
+            if let Some(t) = timer {
+                t.stop();
+            }
+
+            Json(ChatJsonResponse {
+                ok: true,
+                provider: Some(prep.provider_name),
+                model_id: Some(prep.model_id),
+                content: Some(full_response),
+                usage: Some(usage_summary_to_json(&usage_summary)),
+                message: None,
+                warning,
+            })
+        }
+        Ok(Err(e)) => {
+            state.metrics.incr_counter("ai_errors_total", 1).await;
+            let user_msg = if is_provider_overloaded(&e) {
+                "The AI provider is currently overloaded. Please try again in a moment.".to_string()
+            } else {
+                format!("Request failed: {e}")
+            };
+            if let Some(t) = timer {
+                t.stop();
+            }
+            Json(ChatJsonResponse {
+                ok: false,
+                message: Some(user_msg),
+                ..Default::default()
+            })
+        }
+        Err(_) => {
+            state.metrics.incr_counter("ai_errors_total", 1).await;
+            if let Some(t) = timer {
+                t.stop();
+            }
+            Json(ChatJsonResponse {
+                ok: false,
+                message: Some(
+                    "Request timed out. The provider may be slow — please try again.".into(),
+                ),
+                ..Default::default()
+            })
+        }
+    }
+}
+
+// Streaming chat (optional; same validation as `chat_complete`)
+async fn chat_stream(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<ChatRequest>,
+) -> Response {
+    use futures::StreamExt;
+    let timer = state.metrics.start_timer("chat_stream").await;
+
+    let prep = match prepare_chat_turn(&state, &payload).await {
+        Ok(p) => p,
+        Err(PrepareChatFail::RateLimited) => {
+            state
+                .metrics
+                .incr_counter("ai_requests_rate_limited", 1)
+                .await;
+            if let Some(t) = timer {
+                t.stop();
+            }
+            return Response::builder()
+                .status(200)
+                .header("Content-Type", "text/event-stream")
+                .body(Body::from("data: {\"type\":\"rate_limited\"}\n\n"))
+                .unwrap();
+        }
+        Err(PrepareChatFail::Unsafe) => {
+            state.metrics.incr_counter("ai_errors_total", 1).await;
+            let evt = json!({"type":"error","message":"Request content rejected"}).to_string();
+            let resp = Response::builder()
+                .status(200)
+                .header("Content-Type", "text/event-stream")
+                .body(Body::from(format!("data: {}\n\n", evt)))
+                .unwrap();
+            if let Some(t) = timer {
+                t.stop();
+            }
+            return resp;
+        }
+        Err(PrepareChatFail::ModelNotAllowed(model_id)) => {
+            state.metrics.incr_counter("ai_errors_total", 1).await;
+            let evt = json!({"type":"error","message": format!("Model not allowed: {}", model_id)})
+                .to_string();
+            let resp = Response::builder()
+                .status(200)
+                .header("Content-Type", "text/event-stream")
+                .body(Body::from(format!("data: {}\n\n", evt)))
+                .unwrap();
+            if let Some(t) = timer {
+                t.stop();
+            }
+            return resp;
+        }
+    };
 
     let state_clone = state.clone();
-    let user_id = payload.user_id.clone();
-    let session_id = payload.session_id.clone();
-    let user_message = payload.message.clone();
-    let model_id = payload
-        .model_id
-        .clone()
-        .unwrap_or_else(|| state.default_model_id.clone());
-
-    if !is_allowed_model_id(&state, &model_id) {
-        state.metrics.incr_counter("ai_errors_total", 1).await;
-        let evt = json!({"type":"error","message": format!("Model not allowed: {}", model_id)}).to_string();
-        let resp = Response::builder()
-            .status(200)
-            .header("Content-Type", "text/event-stream")
-            .body(Body::from(format!("data: {}\n\n", evt)))
-            .unwrap();
-        if let Some(t) = timer {
-            t.stop();
-        }
-        return resp;
-    }
-
-    let provider_name = model_id.split('/').next().unwrap_or("unknown").to_string();
+    let user_id = prep.user_id.clone();
+    let session_id = prep.session_id.clone();
+    let user_message = prep.user_message.clone();
+    let model_id = prep.model_id.clone();
+    let provider_name = prep.provider_name.clone();
+    let messages = prep.messages;
+    let messages_for_usage = prep.messages_for_usage;
 
     let metrics = state.metrics.clone();
     let stream = async_stream::stream! {
@@ -435,9 +684,13 @@ async fn chat_stream(
             }
         };
 
-        // Runtime chat: builder-based request (no Provider enum, no SDK request structs).
-        // Keep a copy for token estimation after the stream completes.
-        let messages_for_usage = messages.clone();
+        // Runtime chat: builder-based request.
+        // ai-lib-rust already handles retry/fallback per the protocol manifest's
+        // retry_policy (e.g. max_retries:2, exponential backoff) inside
+        // execute_stream → execute_stream_with_cancel_and_stats.
+        // No extra application-level retry is needed here.
+
+        use futures::StreamExt;
         let build_stream = client
             .chat()
             .messages(messages)
@@ -446,9 +699,7 @@ async fn chat_stream(
             .stream()
             .execute_stream();
 
-        // timeouts: 420s for entire request, 300s between chunks (DeepSeek can be very slow)
-        use futures::StreamExt;
-        match tokio::time::timeout(Duration::from_secs(420), build_stream).await {
+        match tokio::time::timeout(Duration::from_secs(120), build_stream).await {
             Ok(Ok(mut s)) => {
                 let mut full_response = String::new();
                 let mut usage_data: Option<serde_json::Value> = None;
@@ -549,22 +800,25 @@ async fn chat_stream(
                 yield format!("data: {}\n\n", usage_evt.to_string());
             }
             Ok(Err(e)) => {
-                // Let ai-lib-rust's configured failover handle retryable errors.
-                // Record the error and surface a short message to the client.
                 metrics.incr_counter("ai_errors_total", 1).await;
-                let evt = json!({"type":"error","message": format!("Stream init failed: {}", e)});
+                let user_msg = if is_provider_overloaded(&e) {
+                    "The AI provider is currently overloaded. Please try again in a moment.".to_string()
+                } else {
+                    format!("Request failed: {e}")
+                };
+                let evt = json!({"type":"error","message": user_msg});
                 yield format!("data: {}\n\n", evt.to_string());
             }
             Err(_) => {
                 metrics.incr_counter("ai_errors_total", 1).await;
-                let evt = json!({"type":"error","message": "Request timeout"});
+                let evt = json!({"type":"error","message": "Request timed out. The provider may be slow — please try again."});
                 yield format!("data: {}\n\n", evt.to_string());
             }
         }
         yield "data: {\"type\":\"done\"}\n\n".to_string();
     };
 
-    let body_stream = stream.map(|chunk| Ok::<_, std::io::Error>(chunk));
+    let body_stream = stream.map(Ok::<_, std::io::Error>);
     Response::builder()
         .status(200)
         .header("Content-Type", "text/event-stream")
@@ -764,7 +1018,7 @@ fn estimate_text_tokens(s: &str) -> usize {
             ascii_run += 1;
         } else {
             if ascii_run > 0 {
-                tokens += (ascii_run + 3) / 4;
+                tokens += ascii_run.div_ceil(4);
                 ascii_run = 0;
             }
             tokens += 1;
@@ -772,7 +1026,7 @@ fn estimate_text_tokens(s: &str) -> usize {
     }
 
     if ascii_run > 0 {
-        tokens += (ascii_run + 3) / 4;
+        tokens += ascii_run.div_ceil(4);
     }
 
     tokens
@@ -809,15 +1063,43 @@ fn allowed_models_from_env() -> Option<Vec<ModelInfo>> {
     }
 }
 
+fn default_allowed_models() -> Vec<ModelInfo> {
+    let mut models = vec![
+        model_info_from_id("deepseek/deepseek-chat"),
+        // Groq current models (llama3-8b-8192 / llama3-70b-8192 are decommissioned)
+        model_info_from_id("groq/llama-3.1-8b-instant"),
+        model_info_from_id("groq/llama-3.3-70b-versatile"),
+    ];
+
+    let optional_with_defaults = [
+        ("ZHIPU_API_KEY", "zhipu/glm-5"),
+        ("MOONSHOT_API_KEY", "moonshot/kimi-k2-5"),
+    ];
+    for (key_env, model_id) in optional_with_defaults {
+        if std::env::var(key_env).is_ok() {
+            models.push(model_info_from_id(model_id));
+        }
+    }
+
+    for model_env in ["QWEN_MODEL_ID", "DOUBAO_MODEL_ID"] {
+        if let Ok(model_id) = std::env::var(model_env) {
+            let trimmed = model_id.trim();
+            if !trimmed.is_empty() {
+                models.push(model_info_from_id(trimmed));
+            }
+        }
+    }
+
+    models
+}
+
 fn model_info_from_id(model_id: &str) -> ModelInfo {
-    let provider = model_id
-        .split('/')
-        .next()
-        .unwrap_or(model_id)
-        .to_string();
+    let provider = model_id.split('/').next().unwrap_or(model_id).to_string();
 
     let display_name = match model_id {
         "deepseek/deepseek-chat" => "DeepSeek Chat".to_string(),
+        "zhipu/glm-5" => "Zhipu • GLM-5".to_string(),
+        "moonshot/kimi-k2-5" => "Moonshot • Kimi K2.5".to_string(),
         "groq/llama-3.1-8b-instant" => "Groq • Llama 3.1 8B Instant".to_string(),
         "groq/llama-3.3-70b-versatile" => "Groq • Llama 3.3 70B Versatile".to_string(),
         "groq/llama3-8b-8192" => "Groq • Llama 3 8B (deprecated)".to_string(),
@@ -848,7 +1130,9 @@ async fn get_or_create_client(
     let built = Arc::new(built);
 
     let mut guard = state.clients.write().await;
-    let entry = guard.entry(model_id.to_string()).or_insert_with(|| built.clone());
+    let entry = guard
+        .entry(model_id.to_string())
+        .or_insert_with(|| built.clone());
     Ok(entry.clone())
 }
 

@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
-<title>AI Streaming Chat</title>
+<title>AI Test Chat</title>
 <style>
 @font-face {
     font-family: 'Intel One Mono';
@@ -356,7 +356,7 @@ body {
 </head>
 <body>
 <div id="header">
-    <h1 id="header-title">AI Streaming Chat</h1>
+    <h1 id="header-title">AI Test Chat</h1>
 </div>
 
 <div id="chat-container"></div>
@@ -368,6 +368,10 @@ body {
         <select id="model-select" aria-label="Model"></select>
         <button id="model-deepseek-btn" class="btn btn-outline" type="button" title="Switch to DeepSeek">DeepSeek</button>
         <button id="model-groq-btn" class="btn btn-outline" type="button" title="Switch to Groq">Groq</button>
+        <label id="stream-toggle-label" style="display:inline-flex;align-items:center;gap:6px;font-size:13px;color:#4a5568;user-select:none;">
+            <input type="checkbox" id="stream-toggle" />
+            Stream (experimental)
+        </label>
     </div>
     
     <textarea id="message-input" placeholder="Type a message... Shift+Enter for newline, Enter to send" rows="1"></textarea>
@@ -425,7 +429,22 @@ const copyLastAssistantBtn = document.getElementById('copy-last-assistant-btn');
 const modelSelect = document.getElementById('model-select');
 const modelDeepSeekBtn = document.getElementById('model-deepseek-btn');
 const modelGroqBtn = document.getElementById('model-groq-btn');
+const streamToggle = document.getElementById('stream-toggle');
 const headerTitle = document.getElementById('header-title');
+
+function wantsStream() {
+    return !!(streamToggle && streamToggle.checked);
+}
+
+function initStreamToggle() {
+    if (!streamToggle || streamToggle.dataset.bound === '1') return;
+    streamToggle.dataset.bound = '1';
+    const streamSaved = localStorage.getItem('aitest_use_stream');
+    streamToggle.checked = streamSaved === '1';
+    streamToggle.addEventListener('change', () => {
+        localStorage.setItem('aitest_use_stream', streamToggle.checked ? '1' : '0');
+    });
+}
 
 let availableModels = [];
 let currentModelId = null;
@@ -437,7 +456,7 @@ function getModelInfo(modelId){
 function setHeaderForModel(modelId){
     const info = getModelInfo(modelId);
     const label = info?.display_name || modelId || 'unknown';
-    if (headerTitle) headerTitle.textContent = `AI Streaming Chat • ${label}`;
+    if (headerTitle) headerTitle.textContent = `AI Test Chat • ${label}`;
 }
 
 function setCurrentModel(modelId, { announce = true } = {}){
@@ -635,14 +654,15 @@ function startNewChat() {
 
 // 简化：无智能模式
 
-// 发送消息
-// (replaced by streaming version below)
+// 发送消息：默认非流式 POST /chat；勾选 Stream 时用 SSE /chat/stream
 
 let currentAbortController = null;
 let isStreaming = false;
-async function sendMessage() {
+
+/** One-shot completion: ai-lib `chat().execute()` on the server. */
+async function sendMessageComplete() {
     if (isStreaming) return;
-    const message = input.value; // do not trim; show exactly what user typed
+    const message = input.value;
     if (!message) return;
     const selectedModelId = currentModelId || localStorage.getItem('aitest_model_id') || null;
     history.push({ role: 'user', content: message });
@@ -653,31 +673,104 @@ async function sendMessage() {
     history.push(assistantMsg);
     renderMessages();
     const assistantNodes = [...chatContainer.querySelectorAll('.message.assistant')];
-    const currentAssistantEl = assistantNodes[assistantNodes.length-1];
-    // Always update only the content area to preserve speaker header
+    const currentAssistantEl = assistantNodes[assistantNodes.length - 1];
+    const contentDiv = currentAssistantEl.querySelector('.message-content') || currentAssistantEl;
+    const body = { user_id: userId, session_id: sessionId, message, model_id: selectedModelId };
+    currentAbortController = new AbortController();
+    isStreaming = true;
+    sendBtn.disabled = false;
+    sendBtn.textContent = '🟥 Stop';
+    contentDiv.textContent = '…';
+    try {
+        const resp = await fetch('/chat', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body),
+            signal: currentAbortController.signal,
+        });
+        let data = {};
+        try {
+            data = await resp.json();
+        } catch (_) {}
+        if (data.warning) addSystemMessage('⚠️ ' + data.warning, 'system-info');
+        if (!data.ok) {
+            addSystemMessage('❌ ' + (data.message || 'Request failed'), 'system-info');
+            contentDiv.textContent = '(Empty response)';
+            assistantMsg.content = '';
+            return;
+        }
+        assistantMsg.provider = data.provider || assistantMsg.provider;
+        assistantMsg.model_id = data.model_id || assistantMsg.model_id;
+        if (data.model_id) setHeaderForModel(data.model_id);
+        const text = typeof data.content === 'string' ? data.content : '';
+        assistantMsg.content = text;
+        const speaker = currentAssistantEl.querySelector('.speaker-info');
+        if (speaker && data.provider) speaker.textContent = `🤖 ${data.provider}`;
+        contentDiv.innerHTML = renderMarkdown(text || '(Empty response)');
+        queueMicrotask(() => { try { enhanceCodeBlocks(contentDiv); } catch (e) {} });
+        if (data.usage) {
+            assistantMsg.usage = data.usage;
+            renderUsageInto(currentAssistantEl, data.usage);
+        }
+        chatContainer.scrollTop = chatContainer.scrollHeight;
+    } catch (e) {
+        if (e && e.name === 'AbortError') {
+            addSystemMessage('⛔ Request cancelled', 'system-info');
+            contentDiv.textContent = '(Cancelled)';
+        } else {
+            console.error(e);
+            addSystemMessage('❌ Request failed: ' + (e && e.message ? e.message : String(e)), 'system-info');
+            contentDiv.textContent = '(Error)';
+        }
+    } finally {
+        endStreaming();
+    }
+}
+
+async function sendMessageStream() {
+    if (isStreaming) return;
+    const message = input.value;
+    if (!message) return;
+    const selectedModelId = currentModelId || localStorage.getItem('aitest_model_id') || null;
+    history.push({ role: 'user', content: message });
+    renderMessages();
+    input.value = '';
+    const initialProvider = (selectedModelId || 'unknown').split('/')[0];
+    const assistantMsg = { role: 'assistant', content: '', provider: initialProvider, model_id: selectedModelId };
+    history.push(assistantMsg);
+    renderMessages();
+    const assistantNodes = [...chatContainer.querySelectorAll('.message.assistant')];
+    const currentAssistantEl = assistantNodes[assistantNodes.length - 1];
     const contentDiv = currentAssistantEl.querySelector('.message-content') || currentAssistantEl;
     const endpoint = '/chat/stream';
-    const body = { user_id:userId, session_id:sessionId, message, model_id: selectedModelId };
+    const body = { user_id: userId, session_id: sessionId, message, model_id: selectedModelId };
     currentAbortController = new AbortController();
-    isStreaming = true; sendBtn.disabled = false; // allow stop
-    sendBtn.textContent='🟥 Stop';
+    isStreaming = true;
+    sendBtn.disabled = false;
+    sendBtn.textContent = '🟥 Stop';
     try {
-        const resp = await fetch(endpoint,{ method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body), signal: currentAbortController.signal });
-        if(!resp.ok||!resp.body) throw new Error('Network error');
-    const reader = resp.body.getReader(); const decoder = new TextDecoder(); let buf=''; let acc='';
-        while(true){
-            const {value,done}=await reader.read(); if(done) break;
-            buf+=decoder.decode(value,{stream:true});
-            const parts=buf.split('\n\n'); buf=parts.pop();
-            for(const p of parts){
-                const lines = p.split('\n').filter(l=>l.startsWith('data:'));
+        const resp = await fetch(endpoint, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body), signal: currentAbortController.signal });
+        if (!resp.ok || !resp.body) throw new Error('Network error');
+        const reader = resp.body.getReader();
+        const decoder = new TextDecoder();
+        let buf = '';
+        let acc = '';
+        while (true) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            buf += decoder.decode(value, { stream: true });
+            const parts = buf.split('\n\n');
+            buf = parts.pop();
+            for (const p of parts) {
+                const lines = p.split('\n').filter((l) => l.startsWith('data:'));
                 if (lines.length === 0) continue;
-                const jsonStr = lines.map(l=> l.startsWith('data: ') ? l.slice(6) : l.slice(5)).join('\n');
-                let evt = null; try { evt = JSON.parse(jsonStr); } catch { continue; }
+                const jsonStr = lines.map((l) => (l.startsWith('data: ') ? l.slice(6) : l.slice(5))).join('\n');
+                let evt = null;
+                try { evt = JSON.parse(jsonStr); } catch { continue; }
                 if (!evt || typeof evt !== 'object') continue;
-                if (evt.type === 'done') { finalizeStream(acc,contentDiv,assistantMsg); endStreaming(); return; }
-                if (evt.type === 'rate_limited') { addSystemMessage('⏱ Too many requests. Please try again later','system-info'); if(!assistantMsg.content){ contentDiv.innerText='(Empty response)'; } endStreaming(); return; }
-                if (evt.type === 'error') { addSystemMessage('❌ Error: '+(evt.message||'unknown'),'system-info'); if(!assistantMsg.content){ contentDiv.innerText='(Empty response)'; } endStreaming(); return; }
+                if (evt.type === 'done') { finalizeStream(acc, contentDiv, assistantMsg); endStreaming(); return; }
+                if (evt.type === 'rate_limited') { addSystemMessage('⏱ Too many requests. Please try again later', 'system-info'); if (!assistantMsg.content) { contentDiv.innerText = '(Empty response)'; } endStreaming(); return; }
+                if (evt.type === 'error') { addSystemMessage('❌ Error: ' + (evt.message || 'unknown'), 'system-info'); if (!assistantMsg.content) { contentDiv.innerText = '(Empty response)'; } endStreaming(); return; }
                 if (evt.type === 'provider') {
                     const prov = evt.provider || 'unknown';
                     assistantMsg.provider = prov;
@@ -690,28 +783,36 @@ async function sendMessage() {
                     continue;
                 }
                 if (evt.type === 'delta' && typeof evt.content === 'string') {
-                    acc = acc + evt.content; assistantMsg.content=acc;
+                    acc = acc + evt.content;
+                    assistantMsg.content = acc;
                     contentDiv.innerHTML = renderMarkdown(acc);
-                    queueMicrotask(() => { try { enhanceCodeBlocks(contentDiv); } catch(e) {} });
-                    chatContainer.scrollTop=chatContainer.scrollHeight;
+                    queueMicrotask(() => { try { enhanceCodeBlocks(contentDiv); } catch (e) {} });
+                    chatContainer.scrollTop = chatContainer.scrollHeight;
                     continue;
                 }
                 if (evt.type === 'usage') {
-                    // Persist on the current assistant message and render under the bubble
                     assistantMsg.usage = evt;
                     renderUsageInto(currentAssistantEl, evt);
                     continue;
                 }
             }
         }
-        finalizeStream(acc,contentDiv,assistantMsg);
+        finalizeStream(acc, contentDiv, assistantMsg);
+    } catch (e) {
+        console.error(e);
+        addSystemMessage('❌ Streaming failed: ' + (e && e.message ? e.message : String(e)), 'system-info');
+    } finally {
+        endStreaming();
     }
-    catch(e){ console.error(e); addSystemMessage('❌ Streaming failed: '+e.message,'system-info'); }
-    finally{ endStreaming(); }
+}
+
+async function sendMessage() {
+    if (wantsStream()) return sendMessageStream();
+    return sendMessageComplete();
 }
 function finalizeStream(text, contentDiv, assistantMsg){ assistantMsg.content=text; contentDiv.innerHTML=renderMarkdown(text||'(Empty response)'); queueMicrotask(() => { try { enhanceCodeBlocks(contentDiv); } catch(e) {} }); chatContainer.scrollTop=chatContainer.scrollHeight; }
 function endStreaming(){ isStreaming=false; sendBtn.disabled=false; sendBtn.textContent='📤 Send'; currentAbortController=null; }
-function cancelStreaming(){ if(currentAbortController){ currentAbortController.abort(); addSystemMessage('⛔ Cancelled current streaming request','system-info');
+function cancelStreaming(){ if(currentAbortController){ currentAbortController.abort(); addSystemMessage('⛔ Cancelled current request','system-info');
     // If nothing streamed yet, mark the assistant bubble as cancelled content
     const assistantNodes = [...chatContainer.querySelectorAll('.message.assistant')];
     const currentAssistantEl = assistantNodes[assistantNodes.length-1];
@@ -753,12 +854,13 @@ input.addEventListener('input', () => {
 
 
 // 初始化
+initStreamToggle();
 fetchModels();
 fetchHistory();
 
 // Welcome message
 setTimeout(() => {
-    addSystemMessage('Welcome. Pick a model (e.g., DeepSeek / Groq) and start chatting. Responses stream in real time.', 'system-info');
+    addSystemMessage('Welcome. Default mode is non-streaming (POST /chat). Enable “Stream (experimental)” for SSE.', 'system-info');
 }, 500);
 </script>
 
